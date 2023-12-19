@@ -403,6 +403,11 @@ class QuantMultiheadAttention(Module):
         #
         # compute in-projection
         #
+        def chunk(x, num=3, dim=-1):
+            _len, _bsz, _dim = x.shape
+            x = x.reshape(_len, _bsz, num, dim)
+            return x[:, :, 0, :], x[:, :, 1, :], x[:, :, 2, :]
+        
 
         if self.in_proj is not None:
             if check_tensors_same_ptr([key, query, value]):
@@ -413,7 +418,9 @@ class QuantMultiheadAttention(Module):
                     else:
                         query.rename_('L', 'N', 'E')
                 # self-attention
-                q, k, v = self.in_proj(query).chunk(3, dim=-1)
+                # q, k, v = self.in_proj(query).chunk(3, dim=-1)
+                q, k, v = chunk(self.in_proj(query), num=3, dim=-1)
+
             else:
                 raise RuntimeError(
                     "Packed in_proj is supported only for self-attention with k is v is q. Set packed_in_proj=False."
