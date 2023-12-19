@@ -541,11 +541,11 @@ class QuantMultiheadAttention(Module):
 
         B, Nt, E = q.shape
         q_scaled = q / math.sqrt(E)
-        k_transposed = k.transpose(-2, -1)
+        #k_transposed = k.transpose(-2, -1)
 
         # Quantize q_scaled and k_transposed
         q_scaled = self.q_scaled_quant(q_scaled)
-        k_transposed = self.k_transposed_quant(k_transposed)
+        k_transposed = self.k_transposed_quant(k_transposed).transpose(-2, -1)
 
         if attn_mask is not None:
             attn_output_weights = torch.baddbmm(attn_mask, q_scaled, k_transposed)
