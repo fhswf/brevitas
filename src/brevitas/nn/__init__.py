@@ -32,3 +32,4 @@ from .quant_upsample import QuantUpsample
 from .quant_upsample import QuantUpsamplingBilinear2d
 from .quant_upsample import QuantUpsamplingNearest2d
 from .target import flexml
+from .quant_layernorm import QuantLayerNorm

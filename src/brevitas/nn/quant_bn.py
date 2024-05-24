@@ -12,7 +12,7 @@ from .quant_layer import BiasQuantType
 from .quant_layer import WeightQuantType
 from .quant_scale_bias import QuantScaleBias
 from .utils import mul_add_from_bn
-
+from torch import Tensor
 
 class _BatchNormToQuantScaleBias(QuantScaleBias, ABC):
 
@@ -71,6 +71,37 @@ class BatchNorm1dToQuantScaleBias(_BatchNormToQuantScaleBias):
             return_quant_tensor=return_quant_tensor,
             **kwargs)
         self.eps = eps
+
+    def inner_forward_impl(self, input: Tensor, quant_weight, quant_bias):
+        """
+        Functionality of BatchNorm, applying a scale and bias.
+        Since the implementation of brevitas' batchnorm does not support batches and 
+        returns 4d Tensors of shape [1,C,C,E] with C being the features, this function is added.
+        It normalizes each sample of a batch and concatenates them into one tensor
+        
+        Args:
+            input: The input to normalize of shape [N,C,L] or [C,L]
+            quant_weight: The scale to multiply the input with
+            quant_bias: The bias to add to the input
+        Returns:
+            out: The normalized output of input of shape [N,C,L] or [C,L]
+        """
+        if len(input.size()) == 2:
+            out = super().inner_forward_impl(input, quant_weight, quant_bias)
+            return out.squeeze(dim=0)[0]
+        N,C,L = input.size()
+        #in place modification of tensors fails during gradient computation, unsure why
+        samples = input
+        out = samples
+        #chunking input returns input of shape [1, C, L], BatchNorm1dToQuantScaleBias then returns tensor of shape [1,C,C,L]
+        #first dimension can be squeezed together, tensors of second dimension are all the same
+        #therefore, take the first "input"
+        for i in range(N):
+            sample = samples[i].clone()
+            x = super().inner_forward_impl(sample, quant_weight, quant_bias)
+            #quanttensor value is read only
+            out[i] = x.squeeze(dim=0)[0] if isinstance(x, Tensor) else x.value.squeeze(dim=0)[0]
+        return out
 
 
 class BatchNorm2dToQuantScaleBias(_BatchNormToQuantScaleBias):
