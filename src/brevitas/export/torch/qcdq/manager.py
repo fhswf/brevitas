@@ -11,8 +11,8 @@ from brevitas.export.manager import _set_proxy_export_mode
 from brevitas.export.manager import BaseManager
 from brevitas.export.manager import ExportContext
 
+from .handler import TorchCDQCastBiasQuantProxyHandler
 from .handler import TorchQCDQCastActQuantProxyHandler
-from .handler import TorchQCDQCastBiasQuantProxyHandler
 from .handler import TorchQCDQCastDecoupledWeightQuantProxyHandler
 from .handler import TorchQCDQCastDecoupledWeightQuantWithInputProxyHandler
 from .handler import TorchQCDQCastTruncQuantProxyHandler
@@ -27,7 +27,7 @@ class TorchQCDQManager(BaseManager):
         TorchQCDQCastDecoupledWeightQuantProxyHandler,
         TorchQCDQCastDecoupledWeightQuantWithInputProxyHandler,
         TorchQCDQCastActQuantProxyHandler,
-        TorchQCDQCastBiasQuantProxyHandler,
+        TorchCDQCastBiasQuantProxyHandler,
         TorchQCDQCastTruncQuantProxyHandler]
 
     @classmethod
@@ -39,7 +39,19 @@ class TorchQCDQManager(BaseManager):
         _set_proxy_export_handler(cls, module)
 
     @classmethod
-    def export(cls, module: Module, args, export_path: Optional[str] = None):
+    def change_weight_export(cls, export_weight_q_node: bool = False):
+        for handler in cls.handlers:
+            if hasattr(handler, '_export_q_node'):
+                handler._export_weight_q_node = export_weight_q_node
+
+    @classmethod
+    def export(
+            cls,
+            module: Module,
+            args,
+            export_path: Optional[str] = None,
+            export_weight_q_node: bool = False):
+        cls.change_weight_export(export_weight_q_node=export_weight_q_node)
         with ExportContext(cls):
             traced_module = cls.jit_inference_trace(module, args, export_path)
         return traced_module

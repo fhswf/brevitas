@@ -4,6 +4,7 @@
 import pytest
 
 from brevitas.quant.scaled_int import Int8AccumulatorAwareWeightQuant
+from brevitas.quant.scaled_int import Int8AccumulatorAwareZeroCenterWeightQuant
 from brevitas.quant.scaled_int import Int8WeightPerChannelFloat
 
 
@@ -41,7 +42,11 @@ def test_import_stt():
 @pytest.mark.parametrize("upscale_factor", [2, 3, 4])
 @pytest.mark.parametrize("num_channels", [1, 3])
 @pytest.mark.parametrize(
-    "weight_quant", [Int8WeightPerChannelFloat, Int8AccumulatorAwareWeightQuant])
+    "weight_quant",
+    [
+        Int8WeightPerChannelFloat,
+        Int8AccumulatorAwareWeightQuant,
+        Int8AccumulatorAwareZeroCenterWeightQuant])
 def test_super_resolution_float_and_quant_models_match(upscale_factor, num_channels, weight_quant):
     import brevitas.config as config
     from brevitas_examples.super_resolution.models import float_espcn
@@ -49,4 +54,20 @@ def test_super_resolution_float_and_quant_models_match(upscale_factor, num_chann
     config.IGNORE_MISSING_KEYS = True
     float_model = float_espcn(upscale_factor, num_channels)
     quant_model = quant_espcn(upscale_factor, num_channels, weight_quant=weight_quant)
+    quant_model.load_state_dict(float_model.state_dict())
+
+
+@pytest.mark.parametrize(
+    "weight_quant",
+    [
+        Int8WeightPerChannelFloat,
+        Int8AccumulatorAwareWeightQuant,
+        Int8AccumulatorAwareZeroCenterWeightQuant])
+def test_image_classification_float_and_quant_models_match(weight_quant):
+    import brevitas.config as config
+    from brevitas_examples.imagenet_classification.a2q.resnet import float_resnet18
+    from brevitas_examples.imagenet_classification.a2q.resnet import quant_resnet18
+    config.IGNORE_MISSING_KEYS = True
+    float_model = float_resnet18(num_classes=10)
+    quant_model = quant_resnet18(num_classes=10, weight_quant=weight_quant)
     quant_model.load_state_dict(float_model.state_dict())

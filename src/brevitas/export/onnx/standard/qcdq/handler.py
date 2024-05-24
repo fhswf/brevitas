@@ -5,20 +5,24 @@ from abc import ABC
 
 import torch
 
-from brevitas.export.common.handler.qcdq import CDQMixin
+from brevitas.export.common.handler.qcdq import CDQCastBiasQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import CDQCastMixin
 from brevitas.export.common.handler.qcdq import DQCastMixin
-from brevitas.export.common.handler.qcdq import QCDQActQuantProxyHandlerMixin
-from brevitas.export.common.handler.qcdq import QCDQBiasQuantProxyHandlerMixin
-from brevitas.export.common.handler.qcdq import QCDQDecoupledWeightQuantProxyHandlerMixin
-from brevitas.export.common.handler.qcdq import QCDQDecoupledWeightQuantWithInputProxyHandlerMixin
-from brevitas.export.common.handler.qcdq import QCDQTruncQuantProxyHandlerMixin
-from brevitas.export.common.handler.qcdq import QCDQWeightQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import DynamicQDQCastActQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import DynamicQMixin
+from brevitas.export.common.handler.qcdq import QCDQCastActQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import QCDQCastDecoupledWeightQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import \
+    QCDQCastDecoupledWeightQuantWithInputProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import QCDQCastTruncQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import QCDQCastWeightQuantProxyHandlerMixin
 from brevitas.export.common.handler.qcdq import QMixin
 from brevitas.export.onnx.handler import ONNXBaseHandler
 from brevitas.export.onnx.handler import QuantLSTMLayerHandler
 
 from ..function import CastFn
 from ..function import DequantizeLinearFn
+from ..function import DynamicQuantizeLinearFn
 from ..function import IntClipFn
 from ..function import QuantizeLinearFn
 
@@ -43,7 +47,7 @@ class StdDQCastONNXMixin(DQCastMixin, ABC):
         assert module.bit_width() > 1., 'Binary quant not supported'
 
 
-class StdCDQCastONNXMixin(CDQMixin, StdDQCastONNXMixin, ABC):
+class StdCDQCastONNXMixin(CDQCastMixin, StdDQCastONNXMixin, ABC):
 
     def clip_fn(self, x, min_val, max_val):
         return IntClipFn.apply(x, min_val, max_val)
@@ -67,44 +71,85 @@ class StdQCDQCastONNXMixin(QMixin, StdCDQCastONNXMixin, ABC):
         super().validate(module)
         # ONNX QuantizeLinear supports only 8b output with round to nearest even.
         # Below 8b quantization is supported through clipping.
-        assert module.rounding_mode.upper() == 'ROUND', 'Only round to nearest even supported'
+        if getattr(self, '_export_q_node', True):
+            assert module.rounding_mode.upper() == 'ROUND', 'Only round to nearest even supported'
+        assert not module.is_groupwise, "Export with Per Group quantization not supported"
+
         self.validate_8b_bit_width(module.bit_width(), le_then=True)
 
     def quantize_fn(self, x, scale, zero_point, dtype, axis):
         return QuantizeLinearFn.apply(x, scale, zero_point, dtype, axis)
 
 
-class StdQCDQCastONNXWeightQuantProxyHandler(StdCDQCastONNXMixin,
-                                             QCDQWeightQuantProxyHandlerMixin,
+class StdDynamicQDQCastONNXMixin(DynamicQMixin, StdDQCastONNXMixin, ABC):
+
+    @classmethod
+    def int8_dtype(cls):
+        return torch.int8
+
+    @classmethod
+    def uint8_dtype(cls):
+        return torch.uint8
+
+    @classmethod
+    def int32_dtype(cls):
+        return torch.int32
+
+    def validate(self, module):
+        super().validate(module)
+
+        assert module.is_signed == False, "Only unsigned quantization supported"
+        assert module.quant_injector.scaling_stats_op == 'min_max', "Only min_max scaling op supported"
+        # ONNX QuantizeLinear supports only 8b output with round to nearest even.
+        # Below 8b quantization is supported through clipping.
+        assert module.rounding_mode.upper() == 'ROUND', 'Only round to nearest even supported'
+        # Below 8b quantization is not supported.
+        self.validate_8b_bit_width(module.bit_width(), le_then=False)
+        # Only per tensor quantization is supported
+        assert not module.quant_injector.scaling_per_output_channel, "Only per tensor scaling supported"
+
+    def quantize_fn(self, x, dtype):
+        return DynamicQuantizeLinearFn.apply(x, dtype)
+
+
+class StdQCDQCastONNXWeightQuantProxyHandler(StdQCDQCastONNXMixin,
+                                             QCDQCastWeightQuantProxyHandlerMixin,
                                              ONNXBaseHandler):
-    pass
+    _export_q_node = False
 
 
-class StdQCDQCastONNXDecoupledWeightQuantProxyHandler(StdCDQCastONNXMixin,
-                                                      QCDQDecoupledWeightQuantProxyHandlerMixin,
+class StdQCDQCastONNXDecoupledWeightQuantProxyHandler(StdQCDQCastONNXMixin,
+                                                      QCDQCastDecoupledWeightQuantProxyHandlerMixin,
                                                       ONNXBaseHandler):
-    pass
+    _export_q_node = False
 
 
 class StdQCDQCastONNXDecoupledWeightQuantWithInputProxyHandler(
-        StdCDQCastONNXMixin, QCDQDecoupledWeightQuantWithInputProxyHandlerMixin, ONNXBaseHandler):
-    pass
+        StdQCDQCastONNXMixin, QCDQCastDecoupledWeightQuantWithInputProxyHandlerMixin,
+        ONNXBaseHandler):
+    _export_q_node = False
 
 
 class StdQCDQCastONNXActQuantProxyHandler(StdQCDQCastONNXMixin,
-                                          QCDQActQuantProxyHandlerMixin,
+                                          QCDQCastActQuantProxyHandlerMixin,
                                           ONNXBaseHandler):
     pass
 
 
-class StdQCDQCastONNXBiasQuantProxyHandler(StdDQCastONNXMixin,
-                                           QCDQBiasQuantProxyHandlerMixin,
-                                           ONNXBaseHandler):
+class StdDynamicQDQCastONNXActQuantProxyHandler(StdDynamicQDQCastONNXMixin,
+                                                DynamicQDQCastActQuantProxyHandlerMixin,
+                                                ONNXBaseHandler):
+    pass
+
+
+class StdCDQCastONNXBiasQuantProxyHandler(StdDQCastONNXMixin,
+                                          CDQCastBiasQuantProxyHandlerMixin,
+                                          ONNXBaseHandler):
     pass
 
 
 class StdQCDQCastONNXTruncQuantProxyHandler(StdQCDQCastONNXMixin,
-                                            QCDQTruncQuantProxyHandlerMixin,
+                                            QCDQCastTruncQuantProxyHandlerMixin,
                                             ONNXBaseHandler):
     pass
 

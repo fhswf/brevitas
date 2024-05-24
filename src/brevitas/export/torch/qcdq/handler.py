@@ -6,13 +6,15 @@ from abc import ABC
 import torch
 
 from brevitas.export.common.handler.base import BaseHandler
+from brevitas.export.common.handler.qcdq import CDQCastBiasQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import CDQCastMixin
 from brevitas.export.common.handler.qcdq import DQCastMixin
-from brevitas.export.common.handler.qcdq import QCDQActQuantProxyHandlerMixin
-from brevitas.export.common.handler.qcdq import QCDQBiasQuantProxyHandlerMixin
-from brevitas.export.common.handler.qcdq import QCDQDecoupledWeightQuantProxyHandlerMixin
-from brevitas.export.common.handler.qcdq import QCDQDecoupledWeightQuantWithInputProxyHandlerMixin
-from brevitas.export.common.handler.qcdq import QCDQTruncQuantProxyHandlerMixin
-from brevitas.export.common.handler.qcdq import QCDQWeightQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import QCDQCastActQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import QCDQCastDecoupledWeightQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import \
+    QCDQCastDecoupledWeightQuantWithInputProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import QCDQCastTruncQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import QCDQCastWeightQuantProxyHandlerMixin
 from brevitas.export.common.handler.qcdq import QMixin
 
 
@@ -55,7 +57,7 @@ class TorchDQCastMixin(DQCastMixin, ABC):
         assert module.bit_width() > 1., 'Binary quant not supported'
 
 
-class TorchCDQCastMixin(TorchDQCastMixin, ABC):
+class TorchCDQCastMixin(CDQCastMixin, TorchDQCastMixin, ABC):
 
     def clip_fn(self, x, min_val, max_val):
         return torch.clamp(x, min_val, max_val)
@@ -77,7 +79,9 @@ class TorchQCDQCastMixin(QMixin, TorchCDQCastMixin, ABC):
 
     def validate(self, module):
         super().validate(module)
-        assert module.rounding_mode.upper() == 'ROUND', 'Only round to nearest even supported'
+        if getattr(self, '_export_q_node', True):
+            assert module.rounding_mode.upper() == 'ROUND', 'Only round to nearest even supported'
+        assert not module.is_groupwise, "Export with Per Group quantization not supported"
 
     def quantize_fn(self, x, scale, zero_point, dtype, axis):
         if axis is None:
@@ -93,9 +97,10 @@ class TorchQCDQHandler(BaseHandler):
         return self.symbolic_execution(*args, **kwargs)
 
 
-class TorchQCDQCastWeightQuantProxyHandler(TorchCDQCastMixin,
-                                           QCDQWeightQuantProxyHandlerMixin,
+class TorchQCDQCastWeightQuantProxyHandler(TorchQCDQCastMixin,
+                                           QCDQCastWeightQuantProxyHandlerMixin,
                                            TorchQCDQHandler):
+    _export_q_node = False
 
     @classmethod
     def int_clip_symbolic_kwargs(cls, narrow, signed, bit_width):
@@ -103,9 +108,10 @@ class TorchQCDQCastWeightQuantProxyHandler(TorchCDQCastMixin,
         return _itemize_clip_bounds(clip_args)
 
 
-class TorchQCDQCastDecoupledWeightQuantProxyHandler(TorchCDQCastMixin,
-                                                    QCDQDecoupledWeightQuantProxyHandlerMixin,
+class TorchQCDQCastDecoupledWeightQuantProxyHandler(TorchQCDQCastMixin,
+                                                    QCDQCastDecoupledWeightQuantProxyHandlerMixin,
                                                     TorchQCDQHandler):
+    _export_q_node = False
 
     @classmethod
     def int_clip_symbolic_kwargs(cls, narrow, signed, bit_width):
@@ -114,7 +120,9 @@ class TorchQCDQCastDecoupledWeightQuantProxyHandler(TorchCDQCastMixin,
 
 
 class TorchQCDQCastDecoupledWeightQuantWithInputProxyHandler(
-        TorchCDQCastMixin, QCDQDecoupledWeightQuantWithInputProxyHandlerMixin, TorchQCDQHandler):
+        TorchQCDQCastMixin, QCDQCastDecoupledWeightQuantWithInputProxyHandlerMixin,
+        TorchQCDQHandler):
+    _export_q_node = False
 
     @classmethod
     def int_clip_symbolic_kwargs(cls, narrow, signed, bit_width):
@@ -123,7 +131,7 @@ class TorchQCDQCastDecoupledWeightQuantWithInputProxyHandler(
 
 
 class TorchQCDQCastActQuantProxyHandler(TorchQCDQCastMixin,
-                                        QCDQActQuantProxyHandlerMixin,
+                                        QCDQCastActQuantProxyHandlerMixin,
                                         TorchQCDQHandler):
 
     @classmethod
@@ -132,14 +140,14 @@ class TorchQCDQCastActQuantProxyHandler(TorchQCDQCastMixin,
         return _itemize_clip_bounds(clip_args)
 
 
-class TorchQCDQCastBiasQuantProxyHandler(TorchDQCastMixin,
-                                         QCDQBiasQuantProxyHandlerMixin,
-                                         TorchQCDQHandler):
+class TorchCDQCastBiasQuantProxyHandler(TorchDQCastMixin,
+                                        CDQCastBiasQuantProxyHandlerMixin,
+                                        TorchQCDQHandler):
     pass
 
 
 class TorchQCDQCastTruncQuantProxyHandler(TorchQCDQCastMixin,
-                                          QCDQTruncQuantProxyHandlerMixin,
+                                          QCDQCastTruncQuantProxyHandlerMixin,
                                           TorchQCDQHandler):
 
     @classmethod

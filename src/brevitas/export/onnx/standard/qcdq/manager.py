@@ -11,11 +11,13 @@ from brevitas.export.onnx.debug import DebugMarkerFunction
 from brevitas.export.onnx.function import LSTMCellFn
 
 from ..function import DequantizeLinearFn
+from ..function import DynamicQuantizeLinearFn
 from ..function import IntClipFn
 from ..function import QuantizeLinearFn
 from ..manager import StdONNXBaseManager
+from .handler import StdCDQCastONNXBiasQuantProxyHandler
+from .handler import StdDynamicQDQCastONNXActQuantProxyHandler
 from .handler import StdQCDQCastONNXActQuantProxyHandler
-from .handler import StdQCDQCastONNXBiasQuantProxyHandler
 from .handler import StdQCDQCastONNXDecoupledWeightQuantProxyHandler
 from .handler import StdQCDQCastONNXDecoupledWeightQuantWithInputProxyHandler
 from .handler import StdQCDQCastONNXQuantLSTMLayerHandler
@@ -34,9 +36,10 @@ class StdQCDQONNXManager(StdONNXBaseManager):
 
     handlers = [
         StdQCDQCastONNXWeightQuantProxyHandler,
-        StdQCDQCastONNXBiasQuantProxyHandler,
+        StdCDQCastONNXBiasQuantProxyHandler,
         StdQCDQCastONNXActQuantProxyHandler,
         StdQCDQCastONNXDecoupledWeightQuantProxyHandler,
+        StdDynamicQDQCastONNXActQuantProxyHandler,
         StdQCDQCastONNXTruncQuantProxyHandler,
         StdQCDQCastONNXDecoupledWeightQuantWithInputProxyHandler,
         StdQCDQCastONNXQuantLSTMLayerHandler]
@@ -44,6 +47,7 @@ class StdQCDQONNXManager(StdONNXBaseManager):
     custom_fns = [
         DebugMarkerFunction,
         QuantizeLinearFn,
+        DynamicQuantizeLinearFn,
         DequantizeLinearFn,
         IntClipFn,
         LSTMCellFn,]
@@ -57,3 +61,14 @@ class StdQCDQONNXManager(StdONNXBaseManager):
     def set_export_handler(cls, module: Module):
         _set_proxy_export_handler(cls, module)
         _set_recurrent_layer_export_handler(cls, module)
+
+    @classmethod
+    def export_onnx(cls, *args, export_weight_q_node: bool = False, **kwargs):
+        cls.change_weight_export(export_weight_q_node)
+        super().export_onnx(*args, **kwargs)
+
+    @classmethod
+    def change_weight_export(cls, export_weight_q_node: bool = False):
+        for handler in cls.handlers:
+            if hasattr(handler, '_export_q_node'):
+                handler._export_q_node = export_weight_q_node
