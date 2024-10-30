@@ -24,10 +24,47 @@ import torch.onnx
 from brevitas import torch_version
 from brevitas.quant_tensor import QuantTensor
 
-from ..manager import _override_inp_caching_mode
-from ..manager import _restore_inp_caching_mode
+from ..manager import _override_act_caching_mode
+from ..manager import _restore_act_caching_mode
 from ..manager import BaseManager
 from ..manager import ExportContext
+
+
+# workaround for fp8 not having many operators implemented
+class PatchFp8Ops():
+
+    def __init__(self):
+        self.lib = None
+
+    def __enter__(self):
+        if torch_version >= version.parse('2.1.0'):
+            self.lib = torch.library.Library("aten", "IMPL")
+
+            def equal_cpu(self, other):
+                if (isinstance(self, Tensor) and
+                        self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)) or (
+                            isinstance(other, Tensor) and
+                            other.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
+                    self = self.to(torch.float32)
+                    other = other.to(torch.float32)
+                    return torch.equal(self, other)
+                else:
+                    res = True
+                    if not isinstance(self, Tensor):
+                        self = torch.tensor(self)
+                    if not isinstance(other, Tensor):
+                        other = torch.tensor(other)
+                    if self.dim() > 0:
+                        for x, y in zip(self.flatten(), other.flatten()):
+                            res &= x == y
+                    else:
+                        res = self.item() == other.item()
+                    return torch.tensor([res])
+
+            self.lib.impl("equal", equal_cpu, "CPU")
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        self.lib = None
 
 
 class ONNXBaseManager(BaseManager, ABC):
@@ -120,20 +157,19 @@ class ONNXBaseManager(BaseManager, ABC):
                     # enable export mode, this triggers collecting export values into handlers
                     cls.set_export_mode(module, enabled=True)
                     # temporarily disable input caching to avoid collectives empty debug values
-                    module.apply(lambda m: _override_inp_caching_mode(m, enabled=False))
+                    module.apply(lambda m: _override_act_caching_mode(m, enabled=False))
                     # perform export pass
-                    with ExitStack() as stack:
-                        for mgr in cls._trace_patches():
-                            stack.enter_context(mgr)
-                        if export_path is not None:
-                            export_target = export_path
-                        else:
-                            model_bytes = BytesIO()
-                            export_target = model_bytes
+                    if export_path is not None:
+                        export_target = export_path
+                    else:
+                        model_bytes = BytesIO()
+                        export_target = model_bytes
+
+                    with PatchFp8Ops():
                         torch.onnx.export(module, args, export_target, **onnx_export_kwargs)
 
                     # restore the model to previous properties
-                    module.apply(lambda m: _restore_inp_caching_mode(m))
+                    module.apply(lambda m: _restore_act_caching_mode(m))
                     cls.set_export_mode(module, enabled=False)
                     module.train(training_state)
 

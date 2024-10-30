@@ -12,8 +12,11 @@ from torch import Tensor
 from brevitas.core.bit_width import *
 from brevitas.core.function_wrapper import TensorClamp
 from brevitas.core.function_wrapper import TensorClampSte
+from brevitas.core.function_wrapper.misc import Identity
+from brevitas.core.function_wrapper.shape import StatsInputViewShapeImpl
 from brevitas.core.scaling import *
 from brevitas.core.scaling import ScalingImplType
+from brevitas.core.scaling import ScalingPerOutputType
 from brevitas.inject import ExtendedInjector
 from brevitas.quant.solver.common import *
 
@@ -108,10 +111,58 @@ class SolveParameterScalingImplFromEnum(SolveAffineRescalingFromEnum):
 class SolveParameterScalingShape(ExtendedInjector):
 
     @value
-    def scaling_shape(scaling_per_output_channel):
-        # this pattern of returning this.something allows to resolve scaling_output_channel_shape
-        # only when scaling_per_output_channel is True
-        if scaling_per_output_channel:
-            return this.scaling_per_output_channel_shape
-        else:
+    def scaling_shape(scaling_per_output, expanded_groupwise_shape=None, group_dim=None):
+        if scaling_per_output == ScalingPerOutputType.TENSOR:
             return SCALAR_SHAPE
+        elif scaling_per_output == ScalingPerOutputType.CHANNEL:
+            return this.scaling_per_output_channel_shape
+        elif scaling_per_output == ScalingPerOutputType.GROUP:
+            # Scaling shape is like expanded_groupwise_shape but has 1 in position group_dim + 1
+            assert expanded_groupwise_shape is not None, "Per Group scaling not correctly configured"
+            assert group_dim is not None, "Per Group scaling not correctly configured"
+            size = list(expanded_groupwise_shape)
+            size[group_dim + 1] = 1
+            return tuple(size)
+
+    @value
+    def reshaped_groupwise_shape(expanded_groupwise_shape, group_dim, group_size):
+        new_shape = list(expanded_groupwise_shape)
+        del new_shape[group_dim + 1]  # delete the group_size shape
+        # Expand the group_dim shape, accounting for padding
+        new_shape[group_dim] = new_shape[group_dim] * group_size
+        return new_shape
+
+    @value
+    def expanded_groupwise_shape(tracked_parameter_list, group_dim, group_size=None):
+        # expanded_groupwise_shape will be called always to create scaling_shape, but it is only needed
+        # for groupwise quantization. All other groupwise shape infos are derived from this.
+
+        # If conditions do not allow for groupwise quantization, early exit and return None
+        if group_size is None:
+            return
+
+        # If group_size is specified and shared quantization is used, raise an error.
+        assert len(tracked_parameter_list) == 1, "Shared groupwise quantization is not currently supported"
+
+        weight_shape = tracked_parameter_list[0].shape
+        size = list(weight_shape)
+        size[group_dim] = (size[group_dim] + group_size - 1) // group_size
+        size.insert(group_dim + 1, group_size)
+        return tuple(size)
+
+    @value
+    def group_dim(module, group_size=None):
+        # group_dim will be called always to create scaling_shape, but it is only needed
+        # for groupwise quantization.
+        if group_size is not None:
+            return 1 if not hasattr(module, 'transposed') or not module.transposed else 0
+
+
+class SolveInputViewImpl(ExtendedInjector):
+
+    @value
+    def input_view_impl(scaling_per_output):
+        if scaling_per_output == ScalingPerOutputType.GROUP:
+            return StatsInputViewShapeImpl.OVER_SUBCHANNEL_BLOCK
+        else:
+            return Identity

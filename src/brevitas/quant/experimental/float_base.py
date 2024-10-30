@@ -1,31 +1,38 @@
 # Copyright (C) 2023, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
+from brevitas.core.function_wrapper import FloatClamp
+from brevitas.core.function_wrapper import TensorClamp
 from brevitas.core.quant.float import FloatQuant
 from brevitas.core.scaling.float_scaling import FloatScaling
 from brevitas.inject import ExtendedInjector
 from brevitas.inject import value
-from brevitas.proxy.parameter_quant import WeightQuantProxyFromInjector
-from brevitas.proxy.runtime_quant import ActQuantProxyFromInjector
+from brevitas.proxy import ActFloatQuantProxyFromInjector
+from brevitas.proxy import WeightFloatQuantProxyFromInjector
 from brevitas.quant.solver import ActQuantSolver
 from brevitas.quant.solver import WeightQuantSolver
 from brevitas.quant.solver.common import SolveTensorQuantFloatToIntImplFromEnum
 
 
-class FloatWeightBase(SolveTensorQuantFloatToIntImplFromEnum):
-    proxy_class = WeightQuantProxyFromInjector
+class FloatBase(SolveTensorQuantFloatToIntImplFromEnum):
     tensor_quant = FloatQuant
     signed = True
     float_to_int_impl_type = 'round'
     scaling_min_val = 1e-10
+    float_clamp_impl = FloatClamp
+    tensor_clamp_impl = TensorClamp
+
+    @value
+    def exponent_bias(exponent_bit_width):
+        return 2 ** (exponent_bit_width - 1) - 1
 
 
-class FloatActBase(SolveTensorQuantFloatToIntImplFromEnum):
-    proxy_class = ActQuantProxyFromInjector
-    tensor_quant = FloatQuant
-    signed = True
-    float_to_int_impl_type = 'round'
-    scaling_min_val = 1e-10
+class FloatWeightBase(FloatBase):
+    proxy_class = WeightFloatQuantProxyFromInjector
+
+
+class FloatActBase(FloatBase):
+    proxy_class = ActFloatQuantProxyFromInjector
 
 
 class ScaledFloatWeightBase(FloatWeightBase, WeightQuantSolver):
@@ -43,20 +50,36 @@ class ScaledFloatActBase(FloatActBase, ActQuantSolver):
     float_scaling_impl = FloatScaling
 
 
-class ExponentBiasMixin(ExtendedInjector):
-
-    @value
-    def exponent_bias(exponent_bit_width):
-        return 2 ** (exponent_bit_width - 1) - 1
-
-
-class Fp8e4m3Mixin(ExponentBiasMixin):
+class Fp8e4m3Mixin(ExtendedInjector):
     bit_width = 8
     exponent_bit_width = 4
     mantissa_bit_width = 3
+    saturating = True
 
 
-class Fp8e5m2Mixin(ExponentBiasMixin):
+class Fp8e5m2Mixin(ExtendedInjector):
     bit_width = 8
     exponent_bit_width = 5
     mantissa_bit_width = 2
+    saturating = True
+
+
+class Fp6e3m2Mixin(ExtendedInjector):
+    bit_width = 6
+    exponent_bit_width = 3
+    mantissa_bit_width = 2
+    saturating = True
+
+
+class Fp6e2m3Mixin(ExtendedInjector):
+    bit_width = 6
+    exponent_bit_width = 2
+    mantissa_bit_width = 3
+    saturating = True
+
+
+class Fp4e2m1Mixin(ExtendedInjector):
+    bit_width = 4
+    exponent_bit_width = 2
+    mantissa_bit_width = 1
+    saturating = True

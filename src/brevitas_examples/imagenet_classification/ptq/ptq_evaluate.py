@@ -18,7 +18,7 @@ import torchvision
 
 from brevitas.export import export_onnx_qcdq
 from brevitas.export import export_torch_qcdq
-from brevitas.graph.equalize import activation_equalization_mode
+from brevitas.export.inference import quant_inference_mode
 from brevitas.graph.quantize import preprocess_for_quantize
 from brevitas.graph.target.flexml import preprocess_for_flexml_quantize
 from brevitas_examples.imagenet_classification.ptq.ptq_common import apply_act_equalization
@@ -121,12 +121,17 @@ parser.add_argument(
 parser.add_argument(
     '--weight-quant-granularity',
     default='per_tensor',
-    choices=['per_tensor', 'per_channel'],
+    choices=['per_tensor', 'per_channel', 'per_group'],
+    help='Weight quantization type (default: per_tensor)')
+parser.add_argument(
+    '--act-quant-granularity',
+    default='per_tensor',
+    choices=['per_tensor', 'per_group'],
     help='Activation quantization type (default: per_tensor)')
 parser.add_argument(
     '--weight-quant-calibration-type',
     default='stats',
-    choices=['stats', 'mse'],
+    choices=['stats', 'mse', 'hqo'],
     help='Weight quantization calibration type (default: stats)')
 parser.add_argument(
     '--act-equalization',
@@ -138,6 +143,11 @@ parser.add_argument(
     default='stats',
     choices=['stats', 'mse'],
     help='Activation quantization calibration type (default: stats)')
+parser.add_argument(
+    '--act-scale-computation-type',
+    default='static',
+    choices=['static', 'dynamic'],
+    help='Activation quantization scale computation type (default: static)')
 parser.add_argument(
     '--graph-eq-iterations',
     default=20,
@@ -164,11 +174,7 @@ parser.add_argument(
     '--export-torch-qcdq',
     action='store_true',
     help='If true, export the model in torch qcdq format')
-add_bool_arg(
-    parser,
-    'scaling-per-output-channel',
-    default=True,
-    help='Weight scaling per output channel (default: enabled)')
+
 add_bool_arg(
     parser, 'bias-corr', default=True, help='Bias correction after calibration (default: enabled)')
 add_bool_arg(
@@ -185,7 +191,7 @@ parser.add_argument('--gpfq-p', default=1.0, type=float, help='P parameter for G
 parser.add_argument(
     '--quant-format',
     default='int',
-    choices=['int', 'float'],
+    choices=['int', 'float', 'float_ocp'],
     help='Quantization format to use for weights and activations (default: int)')
 parser.add_argument(
     '--layerwise-first-last-mantissa-bit-width',
@@ -234,6 +240,12 @@ parser.add_argument(
     help=
     'Split Ratio for Channel Splitting. When set to 0.0, Channel Splitting will not be applied. (default: 0.0)'
 )
+parser.add_argument(
+    '--compression-rate',
+    default=0.0,
+    type=float,
+    help='Specify compression rate < 1.0 for random projection. Default is 0.0 and does not use RP.'
+)
 add_bool_arg(parser, 'gptq', default=False, help='GPTQ (default: disabled)')
 add_bool_arg(parser, 'gpfq', default=False, help='GPFQ (default: disabled)')
 add_bool_arg(parser, 'gpfa2q', default=False, help='GPFA2Q (default: disabled)')
@@ -251,6 +263,19 @@ add_bool_arg(
     'merge-bn',
     default=True,
     help='Merge BN layers before quantizing the model (default: enabled)')
+add_bool_arg(
+    parser,
+    'uint_sym_act_for_unsigned_values',
+    default=True,
+    help='Use unsigned act quant when possible (default: enabled)')
+add_bool_arg(parser, 'compile', default=False, help='Use torch.compile (default: disabled)')
+
+
+def generate_ref_input(args, device, dtype):
+    model_config = get_model_config(args.model_name)
+    center_crop_shape = model_config['center_crop_shape']
+    img_shape = center_crop_shape
+    return torch.ones(1, 3, img_shape, img_shape, device=device, dtype=dtype)
 
 
 def main():
@@ -349,6 +374,7 @@ def main():
     # Get the model from torchvision
     model = get_torchvision_model(args.model_name)
     model = model.to(dtype)
+    model.eval()
 
     # Preprocess the model for quantization
     if args.target_backend == 'flexml':
@@ -393,6 +419,7 @@ def main():
         weight_narrow_range=args.weight_narrow_range,
         weight_param_method=args.weight_quant_calibration_type,
         weight_quant_granularity=args.weight_quant_granularity,
+        act_quant_granularity=args.act_quant_granularity,
         weight_quant_type=args.weight_quant_type,
         layerwise_first_last_bit_width=args.layerwise_first_last_bit_width,
         act_bit_width=args.act_bit_width,
@@ -405,15 +432,23 @@ def main():
         weight_mantissa_bit_width=args.weight_mantissa_bit_width,
         weight_exponent_bit_width=args.weight_exponent_bit_width,
         act_mantissa_bit_width=args.act_mantissa_bit_width,
-        act_exponent_bit_width=args.act_exponent_bit_width)
+        act_exponent_bit_width=args.act_exponent_bit_width,
+        act_scale_computation_type=args.act_scale_computation_type,
+        uint_sym_act_for_unsigned_values=args.uint_sym_act_for_unsigned_values)
 
-    # Calibrate the quant_model on the calibration dataloader
-    print("Starting activation calibration:")
-    calibrate(calib_loader, quant_model)
+    if args.act_scale_computation_type == 'static':
+        # Calibrate the quant_model on the calibration dataloader
+        print("Starting activation calibration:")
+        calibrate(calib_loader, quant_model)
 
     if args.gpfq:
         print("Performing GPFQ:")
-        apply_gpfq(calib_loader, quant_model, p=args.gpfq_p, act_order=args.gpxq_act_order)
+        apply_gpfq(
+            calib_loader,
+            quant_model,
+            p=args.gpfq_p,
+            act_order=args.gpxq_act_order,
+            compression_rate=args.compression_rate)
 
     if args.gpfa2q:
         print("Performing GPFA2Q:")
@@ -423,7 +458,8 @@ def main():
             p=args.gpfq_p,
             act_order=args.gpxq_act_order,
             use_gpfa2q=args.gpfa2q,
-            accumulator_bit_width=args.accumulator_bit_width)
+            accumulator_bit_width=args.accumulator_bit_width,
+            compression_rate=args.compression_rate)
 
     if args.gptq:
         print("Performing GPTQ:")
@@ -447,23 +483,28 @@ def main():
 
     # Validate the quant_model on the validation dataloader
     print("Starting validation:")
-    validate(val_loader, quant_model, stable=dtype != torch.bfloat16)
+    with torch.no_grad(), quant_inference_mode(quant_model):
+        param = next(iter(quant_model.parameters()))
+        device, dtype = param.device, param.dtype
+        ref_input = generate_ref_input(args, device, dtype)
+        quant_model(ref_input)
+        compiled_model = torch.compile(quant_model, fullgraph=True, disable=not args.compile)
+        validate(val_loader, compiled_model, stable=dtype != torch.bfloat16)
 
     if args.export_onnx_qcdq or args.export_torch_qcdq:
         # Generate reference input tensor to drive the export process
-        model_config = get_model_config(args.model_name)
-        center_crop_shape = model_config['center_crop_shape']
-        img_shape = center_crop_shape
-        device, dtype = next(model.parameters()).device, next(model.parameters()).dtype
-        ref_input = torch.ones(1, 3, img_shape, img_shape, device=device, dtype=dtype)
+        param = next(iter(quant_model.parameters()))
+        device, dtype = param.device, param.dtype
+        ref_input = generate_ref_input(args, device, dtype)
 
         export_name = os.path.join(args.export_dir, config)
         if args.export_onnx_qcdq:
             export_name = export_name + '.onnx'
-            export_onnx_qcdq(model, ref_input, export_name, opset_version=args.onnx_opset_version)
+            export_onnx_qcdq(
+                quant_model, ref_input, export_name, opset_version=args.onnx_opset_version)
         if args.export_torch_qcdq:
             export_name = export_name + '.pt'
-            export_torch_qcdq(model, ref_input, export_name)
+            export_torch_qcdq(quant_model, ref_input, export_name)
 
 
 if __name__ == '__main__':

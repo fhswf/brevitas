@@ -1,8 +1,11 @@
 # Copyright (C) 2023, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-from typing import Optional, Tuple, Union
+from abc import ABC
+from abc import abstractmethod
+from typing import Any, Optional, Tuple, Union
 
+import torch
 from torch import nn
 from torch import Tensor
 from torch.nn import Identity
@@ -10,7 +13,10 @@ from typing_extensions import Protocol
 from typing_extensions import runtime_checkable
 
 import brevitas
+from brevitas import is_dynamo_compiling
+from brevitas.quant_tensor import IntQuantTensor
 from brevitas.quant_tensor import QuantTensor
+from brevitas.utils.quant_utils import _CachedIO
 
 from .quant_proxy import QuantProxyFromInjector
 from .quant_proxy import QuantProxyProtocol
@@ -79,16 +85,47 @@ class FusedActivationQuantProxy(brevitas.jit.ScriptModule):
     @brevitas.jit.script_method
     def forward(self, x):
         x = self.activation_impl(x)
-        x, output_scale, output_zp, output_bit_width = self.tensor_quant(x)
-        return x, output_scale, output_zp, output_bit_width
+        return self.tensor_quant(x)
 
 
-class ActQuantProxyFromInjector(QuantProxyFromInjector, ActQuantProxyProtocol):
+class ActQuantProxyFromInjectorBase(QuantProxyFromInjector, ActQuantProxyProtocol, ABC):
 
     def __init__(self, quant_layer, quant_injector):
         QuantProxyFromInjector.__init__(self, quant_layer, quant_injector)
         ActQuantProxyProtocol.__init__(self)
         self.is_passthrough_act = _is_passthrough_act(quant_injector)
+        self._cached_act = None
+        self.cache_inference_quant_act = False
+        self.cache_quant_io_metadata_only = True
+        self.cache_class = None
+
+    @property
+    def input_view_impl(self):
+        if self.fused_activation_quant_proxy.tensor_quant is not None and not isinstance(
+                self.fused_activation_quant_proxy.tensor_quant, _TensorQuantDisabledIdentity):
+            return self.fused_activation_quant_proxy.tensor_quant.int_quant.input_view_impl
+        else:
+            return Identity()
+
+    def internal_forward(self, force_eval):
+        current_status = self.training
+        if force_eval:
+            self.eval()
+        out = self.__call__(self._zero_hw_sentinel())
+        self.train(current_status)
+        return out
+
+    def retrieve_attribute(self, attribute, force_eval):
+        if self._cached_act is not None:
+            return getattr(self._cached_act, attribute)
+        elif self.is_quant_enabled:
+            out = self.internal_forward(force_eval)
+            return getattr(out, attribute)
+        elif self._cached_act is None:
+            return None
+
+    def apply_input_view(self, x):
+        return self.input_view_impl(x)
 
     @property
     def is_quant_enabled(self):
@@ -117,56 +154,85 @@ class ActQuantProxyFromInjector(QuantProxyFromInjector, ActQuantProxyProtocol):
         else:
             self.fused_activation_quant_proxy = None
 
+    @abstractmethod
+    def create_quant_tensor(
+            self,
+            qt_args: Union[torch.Tensor, Tuple[Any]],
+            x: Optional[QuantTensor] = None) -> QuantTensor:
+        # Supports the following:
+        # - qt_args as tuple of Tensors and bools = standard quant activations
+        # - qt_args as Tensor and x as QuantTensor = passthrough activation
+        # In both cases, the output is a QuantTensor
+        raise NotImplementedError
+
+    def forward(self, x: Union[Tensor, QuantTensor]) -> Union[Tensor, QuantTensor]:
+        # If fused activation quant proxy is not enabled, return the input
+        if self.fused_activation_quant_proxy is None:
+            return x
+
+        y = x
+        if isinstance(y, QuantTensor):
+            y = y.value
+
+        if self.export_mode:
+            y = self.fused_activation_quant_proxy.activation_impl(y)
+            y = self.export_handler(y)
+        elif not self.is_quant_enabled:
+            # A tuple helps later with control flows
+            # The second None value is used later
+            # If quant is not enabled, we still apply input_view in the case of groupwise + padding
+            y = self.apply_input_view(self.fused_activation_quant_proxy.activation_impl(y))
+            y = (y, None)
+        else:
+            y = self.fused_activation_quant_proxy(y)
+        # If y is an empty QuantTensor, we need to check if this is a passthrough proxy,
+        # otherwise return a simple Tensor
+
+        if is_dynamo_compiling():
+            out = y[0]
+        else:
+            # If the second value (i.e., scale) is None, then quant is disabled
+            if y[1] is not None:
+                out = self.create_quant_tensor(y)
+            elif self.is_passthrough_act and isinstance(x, QuantTensor):
+                # preserve scale/zp/bit/sign even without output quant
+                y = y[0]
+                out = self.create_quant_tensor(y, x=x)
+            else:
+                out = y[0]
+
+        if not self.training and self.cache_inference_quant_act and isinstance(out, QuantTensor):
+            cached_out = self.cache_class(out.detach(), self.cache_quant_io_metadata_only)
+            self._cached_act = cached_out
+        return out
+
+
+class ActQuantProxyFromInjector(ActQuantProxyFromInjectorBase):
+
+    def __init__(self, quant_layer, quant_injector):
+        super().__init__(quant_layer, quant_injector)
+        self.cache_class = _CachedIO
+
     def scale(self, force_eval=True):
-        current_status = self.training
-        if force_eval:
-            self.eval()
-        scale = self.__call__(self._zero_hw_sentinel()).scale
-        self.train(current_status)
-        return scale
+        return self.retrieve_attribute('scale', force_eval)
 
     def zero_point(self, force_eval=True):
-        current_status = self.training
-        if force_eval:
-            self.eval()
-        zero_point = self.__call__(self._zero_hw_sentinel()).zero_point
-        self.train(current_status)
-        return zero_point
+        return self.retrieve_attribute('zero_point', force_eval)
 
-    def bit_width(self):
-        scale = self.__call__(self._zero_hw_sentinel()).bit_width
-        return scale
+    def bit_width(self, force_eval=True):
+        return self.retrieve_attribute('bit_width', force_eval)
 
-    def forward(self, x: Union[Tensor, QuantTensor]) -> QuantTensor:
-        if self.fused_activation_quant_proxy is not None:
-            y = x
-            if isinstance(y, QuantTensor):
-                y = y.value
+    def create_quant_tensor(
+            self,
+            qt_args: Union[Tensor, Tuple[Any]],
+            x: Optional[IntQuantTensor] = None) -> IntQuantTensor:
 
-            if self.export_mode:
-                y = self.fused_activation_quant_proxy.activation_impl(y)
-                y = self.export_handler(y)
-            elif not self.is_quant_enabled:
-                y = self.fused_activation_quant_proxy.activation_impl(y)
-            else:
-                y = self.fused_activation_quant_proxy(y)
-            # If y is an empty QuantTensor, we need to check if this is a passthrough proxy,
-            # otherwise return an empty QuantTensor
-            if isinstance(y, tuple) and not any(map(lambda f: f is None, y)):
-                return QuantTensor(*y, signed=self.is_signed, training=self.training)
-            elif self.is_passthrough_act:  # preserve scale/zp/bit/sign even without output quant
-                if isinstance(y, tuple):
-                    y = y[0]
-                return QuantTensor(y, x.scale, x.zero_point, x.bit_width, x.signed, self.training)
-            else:
-                if isinstance(y, tuple):
-                    y = y[0]
-                return QuantTensor(y, training=self.training)
+        if x is None:
+            out = IntQuantTensor(*qt_args, self.is_signed, self.training)
         else:
-            if isinstance(x, QuantTensor):  # passthrough
-                return x
-            else:
-                return QuantTensor(x, training=self.training)
+            out = IntQuantTensor(
+                qt_args, x.scale, x.zero_point, x.bit_width, x.signed, self.training)
+        return out
 
 
 class DynamicActQuantProxyFromInjector(ActQuantProxyFromInjector):
@@ -177,18 +243,14 @@ class DynamicActQuantProxyFromInjector(ActQuantProxyFromInjector):
     def zero_point(self, force_eval=True):
         raise RuntimeError("Zero point for Dynamic Act Quant is input-dependant")
 
-    def bit_width(self):
-        bit_width = self.__call__(self._zero_hw_sentinel()).bit_width
-        return bit_width
-
 
 class ClampQuantProxyFromInjector(QuantProxyFromInjector, AccQuantProxyProtocol):
 
-    def forward(self, x: QuantTensor):
+    def forward(self, x: IntQuantTensor) -> Union[Tensor, IntQuantTensor]:
         if self.is_quant_enabled:
             out_tuple = self.tensor_quant(x.value, x.scale, x.bit_width)
             out_value, out_scale, out_zp, out_bit_width = out_tuple
-            return QuantTensor(
+            return IntQuantTensor(
                 out_value, out_scale, out_zp, out_bit_width, self.is_signed, self.training)
         return x
 
@@ -196,12 +258,15 @@ class ClampQuantProxyFromInjector(QuantProxyFromInjector, AccQuantProxyProtocol)
 class TruncQuantProxyFromInjector(QuantProxyFromInjector, AccQuantProxyProtocol):
 
     def bit_width(self):
+        if not self.is_quant_enabled:
+            return None
         zhs = self._zero_hw_sentinel()
-        empty_imp = QuantTensor(zhs, zhs, zhs, zhs)
+        # Signed might or might not be defined. We just care about retrieving the bitwidth
+        empty_imp = IntQuantTensor(zhs, zhs, zhs, zhs, signed=True, training=self.training)
         bit_width = self.__call__(empty_imp).bit_width
         return bit_width
 
-    def forward(self, x: QuantTensor):
+    def forward(self, x: IntQuantTensor) -> Union[Tensor, IntQuantTensor]:
         if self.is_quant_enabled:
             if self.export_mode:
                 out_tuple = self.export_handler(
@@ -209,7 +274,8 @@ class TruncQuantProxyFromInjector(QuantProxyFromInjector, AccQuantProxyProtocol)
             else:
                 out_tuple = self.tensor_quant(x.value, x.scale, x.zero_point, x.bit_width)
             out_value, out_scale, out_zp, out_bit_width = out_tuple
-            return QuantTensor(out_value, out_scale, out_zp, out_bit_width, x.signed, self.training)
+            return IntQuantTensor(
+                out_value, out_scale, out_zp, out_bit_width, x.signed, self.training)
         else:
             return x
 

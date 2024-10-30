@@ -10,8 +10,11 @@ from torch.nn import Parameter
 
 import brevitas
 from brevitas import config
+from brevitas.core.function_wrapper.misc import Identity
+from brevitas.core.function_wrapper.ops_ste import ScalarClampMinSte
 from brevitas.core.utils import StatelessBuffer
 from brevitas.function.ops import max_int
+from brevitas.quant_tensor import _unpack_quant_tensor
 # Use custom implementation of kthvalue as work around to (b)float16 kernel limitations
 from brevitas.utils.torch_utils import kthvalue
 
@@ -439,6 +442,19 @@ def _set_local_loss_mode(module, enabled):
             m.local_loss_mode = enabled
 
 
+def _set_observer_mode(module, enabled, previous_observer_mode):
+    for m in module.modules():
+        if hasattr(m, 'observer_only'):
+            previous_observer_mode[m] = m.observer_only
+            m.observer_only = enabled
+
+
+def _restore_observer_mode(module, previous_observer_mode):
+    for m in module.modules():
+        if hasattr(m, 'observer_only'):
+            m.observer_only = previous_observer_mode[m]
+
+
 class MSE(torch.nn.Module):
     # References:
     # https://github.com/cornell-zhang/dnn-quant-ocs/blob/master/distiller/quantization/clip.py
@@ -456,7 +472,12 @@ class MSE(torch.nn.Module):
         self.mse_init_op = mse_init_op
         self.input_view_shape_impl = inner_stats_input_view_shape_impl
         self.proxy_forward = proxy_module.forward
+        self.previous_observer_mode = dict()
         self.set_local_loss_mode = lambda enabled: _set_local_loss_mode(proxy_module, enabled)
+        self.set_observer_mode = lambda enabled: _set_observer_mode(
+            proxy_module, enabled, self.previous_observer_mode)
+        self.restore_observer_mode = lambda: _restore_observer_mode(
+            proxy_module, self.previous_observer_mode)
         self.internal_candidate = None
         self.num = mse_iters
         self.search_method = mse_search_method
@@ -477,11 +498,12 @@ class MSE(torch.nn.Module):
         self.internal_candidate = candidate
         # Set to local_loss_mode before calling the proxy
         self.set_local_loss_mode(True)
+        self.set_observer_mode(False)
         quant_value = self.proxy_forward(x)
-        if isinstance(quant_value, tuple):
-            quant_value = quant_value[0]
+        quant_value = _unpack_quant_tensor(quant_value)
         loss = self.mse_loss_fn(x, quant_value)
         self.set_local_loss_mode(False)
+        self.restore_observer_mode()
         return loss
 
     def mse_grid_search(self, xl, x):
@@ -544,3 +566,241 @@ class MSE(torch.nn.Module):
                 x = self.input_view_shape_impl(x)
                 self.internal_candidate = self.mse_init_op(x).detach()
             return self.internal_candidate
+
+
+class HalfQuadraticOptimizerScale(torch.nn.Module):
+    # References:
+    # https://mobiusml.github.io/hqq_blog/
+    # https://github.com/mobiusml/hqq?tab=readme-ov-file
+
+    def __init__(
+            self,
+            proxy_module,
+            hqo_init_op_scale,
+            keepdim: bool,
+            inner_stats_input_view_shape_impl: torch.nn.Module,
+            scaling_min_val: Optional[float] = None,
+            stats_reduce_dim: Optional[int] = None,
+            int_scaling_impl=None,
+            bit_width_impl=None,
+            hqo_beta_scale: float = 1e5,
+            hqo_kappa_scale: float = 1.01,
+            hqo_lp_norm_scale: float = .7,
+            hqo_iters_scale: int = 1000):
+        super(HalfQuadraticOptimizerScale, self).__init__()
+        self.hqo_init_op = hqo_init_op_scale
+        self.input_view_shape_impl = inner_stats_input_view_shape_impl
+        self.proxy_forward = proxy_module.forward
+        self.previous_observer_mode = dict()
+        self.set_local_loss_mode = lambda enabled: _set_local_loss_mode(proxy_module, enabled)
+        self.set_observer_mode = lambda enabled: _set_observer_mode(
+            proxy_module, enabled, self.previous_observer_mode)
+        self.restore_observer_mode = lambda: _restore_observer_mode(
+            proxy_module, self.previous_observer_mode)
+        self.internal_candidate = None
+        self.hqo_iters = hqo_iters_scale
+        self.stats_reduce_dim = stats_reduce_dim
+        self.local_loss_mode: bool = False
+
+        self.beta = hqo_beta_scale
+        self.kappa = hqo_kappa_scale
+        self.lp_norm = hqo_lp_norm_scale
+
+        self.int_scaling_impl = int_scaling_impl
+        self.msb_clamp_bit_width_impl = bit_width_impl
+        if scaling_min_val is not None and scaling_min_val != 0:
+            self.clamp_min_ste = ScalarClampMinSte(scaling_min_val)
+        else:
+            self.clamp_min_ste = Identity()
+        self.keepdim = keepdim
+
+    def parameter_search(self, xl, x):
+        best_loss = torch.tensor(float('inf'), device=x.device, dtype=x.dtype)
+        candidate = xl
+        best_candidate = candidate
+        beta = self.beta
+        with torch.no_grad():
+            for i in range(0, self.hqo_iters):
+                self.internal_candidate = candidate
+                self.set_local_loss_mode(True)
+                self.set_observer_mode(False)
+                quant_tensor = self.proxy_forward(x).detach()
+                self.set_local_loss_mode(False)
+                self.restore_observer_mode()
+                loss = torch.abs(quant_tensor.value - x).mean()
+
+                best_candidate = torch.where(loss < best_loss, candidate, best_candidate)
+                if loss >= best_loss:
+                    break
+                best_loss = torch.min(loss, best_loss)
+                W_e = shrink_lp_op(x - quant_tensor.value, beta, self.lp_norm)
+                zero_point = quant_tensor.zero_point
+                num = self.input_view_shape_impl(x - W_e).detach()
+                den = self.input_view_shape_impl(
+                    torch.round(quant_tensor.value / quant_tensor.scale) - zero_point).detach()
+                mask = (num != 0.) & (den != 0.)
+                if self.stats_reduce_dim is None:
+                    candidate = masked_median(num / den, mask)
+                else:
+                    candidate = masked_median(
+                        num / den, mask, dim=self.stats_reduce_dim, keepdim=self.keepdim)
+                candidate = candidate.type_as(self.internal_candidate)
+                candidate = self.clamp_min_ste(candidate)
+                bit_width = self.msb_clamp_bit_width_impl()
+                int_threshold = self.int_scaling_impl(bit_width)
+                candidate = candidate * int_threshold
+                candidate[torch.isnan(candidate)] = self.internal_candidate[torch.isnan(candidate)]
+                candidate[torch.isinf(candidate)] = self.internal_candidate[torch.isinf(candidate)]
+                beta *= self.kappa
+        return best_candidate
+
+    def optimize(self, x):
+        x_view = self.input_view_shape_impl(x)
+
+        init = self.hqo_init_op(x_view).detach()
+        best_candidate = self.parameter_search(init, x_view)
+
+        # Save for evaluation by other modules (e.g. zp) invoking local loss mode
+        self.internal_candidate = best_candidate.detach()
+        torch.cuda.empty_cache()
+        return best_candidate
+
+    def forward(self, x):
+        if not self.local_loss_mode:
+            with torch.no_grad():
+                return self.optimize(x)
+        else:
+            # This is invoked for the zero-point whenever scale is being optimized first
+            if self.internal_candidate is None:
+                x = self.input_view_shape_impl(x)
+                self.internal_candidate = self.hqo_init_op(x).detach()
+            return self.internal_candidate
+
+
+class HalfQuadraticOptimizerZeroPoint(torch.nn.Module):
+    # References:
+    # https://mobiusml.github.io/hqq_blog/
+    # https://github.com/mobiusml/hqq?tab=readme-ov-file
+
+    def __init__(
+            self,
+            proxy_module,
+            keepdim: bool,
+            hqo_init_op_zp: torch.nn.Module,
+            inner_stats_input_view_shape_impl: torch.nn.Module,
+            stats_reduce_dim: Optional[int] = None,
+            hqo_beta_zp: float = 1e0,
+            hqo_kappa_zp: float = 1.01,
+            hqo_lp_norm_zp: float = .5,
+            hqo_iters_zp: int = 1000):
+        super(HalfQuadraticOptimizerZeroPoint, self).__init__()
+        self.hqo_init_op_zp = hqo_init_op_zp
+        self.input_view_shape_impl = inner_stats_input_view_shape_impl
+        self.proxy_forward = proxy_module.forward
+        self.previous_observer_mode = dict()
+        self.set_local_loss_mode = lambda enabled: _set_local_loss_mode(proxy_module, enabled)
+        self.set_observer_mode = lambda enabled: _set_observer_mode(
+            proxy_module, enabled, self.previous_observer_mode)
+        self.restore_observer_mode = lambda: _restore_observer_mode(
+            proxy_module, self.previous_observer_mode)
+        self.internal_candidate = None
+        self.stats_reduce_dim = stats_reduce_dim
+        self.local_loss_mode: bool = False
+        self.beta = hqo_beta_zp
+        self.kappa = hqo_kappa_zp
+        self.lp_norm = hqo_lp_norm_zp
+        self.hqo_iters = hqo_iters_zp
+        self.keepdim = keepdim
+
+    def parameter_search(self, xl, x):
+        best_loss = torch.tensor(float('inf'), device=x.device, dtype=x.dtype)
+        candidate = xl
+        best_candidate = candidate
+        with torch.no_grad():
+            for i in range(0, self.hqo_iters):
+                self.internal_candidate = candidate
+                self.set_local_loss_mode(True)
+                self.set_observer_mode(False)
+                quant_tensor = self.proxy_forward(x).detach()
+                self.set_local_loss_mode(False)
+                self.restore_observer_mode()
+                qt_value = self.input_view_shape_impl(quant_tensor.value)
+                qt_scale = self.input_view_shape_impl(quant_tensor.scale)
+                qt_zp = self.input_view_shape_impl(quant_tensor.zero_point)
+                qt_int = qt_value / qt_scale + qt_zp
+                loss = torch.abs(qt_value - x).mean()
+                best_candidate = torch.where(loss < best_loss, candidate, best_candidate)
+                if loss >= best_loss:
+                    break
+                best_loss = torch.min(loss, best_loss)
+                W_e = shrink_lp_op(x - qt_value, self.beta, self.lp_norm)
+
+                # Compared to the original formulation, the value we're looking for is:
+                # - scaled by qt_scale
+                # - opposite sign
+                val = self.input_view_shape_impl((x - W_e) - qt_int * qt_scale)
+
+                if self.stats_reduce_dim is None:
+                    candidate = torch.mean(val)
+                else:
+                    candidate = torch.mean(val, dim=self.stats_reduce_dim, keepdim=self.keepdim)
+                self.beta *= self.kappa
+        return best_candidate
+
+    def optimize(self, x):
+        x_view = self.input_view_shape_impl(x)
+
+        init = self.hqo_init_op_zp(x_view).detach()
+
+        best_candidate = self.parameter_search(init, x)
+
+        # Save for evaluation by other modules (e.g. zp) invoking local loss mode
+        self.internal_candidate = best_candidate.detach()
+        torch.cuda.empty_cache()
+        return best_candidate
+
+    def forward(self, x):
+        if not self.local_loss_mode:
+            with torch.no_grad():
+                return self.optimize(x)
+        else:
+            # This is invoked for the zero-point whenever scale is being optimized first
+            if self.internal_candidate is None:
+                x = self.input_view_shape_impl(x)
+                self.internal_candidate = self.hqo_init_op_zp(x).detach()
+            return self.internal_candidate
+
+
+def masked_median(x, mask, dim=None, keepdim=False):
+    """Compute the median of tensor x along dim, ignoring values where mask is False.
+    x and mask need to be broadcastable.
+
+    Args:
+        x (Tensor): Tensor to compute median of.
+        mask (BoolTensor): Same shape as x with True where x is valid and False
+            where x should be masked. Mask should not be all False in any column of
+            dimension dim to avoid NaNs from zero division.
+        dim (int, optional): Dimension to take median of. Defaults to 0.
+
+    Returns:
+        Tensor: Same shape as x, except dimension dim reduced.
+    """
+    # uncomment this assert for safety but might impact performance
+    # assert (
+    #     mask.sum(dim=dim).ne(0).all()
+    # ), "mask should not be all False in any column, causes zero division"
+    x_nan = x.float().masked_fill(~mask, float("nan"))
+    if dim is None:
+        x_median = x_nan.nanmedian()
+    else:
+        x_median, _ = x_nan.nanmedian(dim=dim, keepdim=keepdim)
+    return x_median
+
+
+# Shrinking operator
+def shrink_lp_op(x: Tensor, beta: float, lp_norm: float) -> Tensor:
+    if lp_norm == 1:
+        return torch.sign(x) * torch.nn.functional.relu(torch.abs(x) - 1.0 / beta)
+    else:
+        return torch.sign(x) * torch.nn.functional.relu(
+            torch.abs(x) - (1.0 / beta) * torch.pow(torch.abs(x), lp_norm - 1))

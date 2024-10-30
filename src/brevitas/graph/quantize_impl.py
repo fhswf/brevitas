@@ -18,8 +18,6 @@ ADD_FNS = [torch.add, operator.add, operator.iadd]
 
 ADD_METHODS = ['add', 'add_']
 
-CAT = brevitas.original_cat
-
 SIGN_PRESERVING_MODULES = (
     nn.Dropout,
     nn.Dropout2d,
@@ -82,12 +80,13 @@ def are_inputs_unsigned(model, node, is_unsigned_list, quant_act_map, unsigned_a
             elif isinstance(inp_module, tuple(SIGN_PRESERVING_MODULES)):
                 are_inputs_unsigned(
                     model, inp_node, is_unsigned_list, quant_act_map, unsigned_act_tuple)
-            elif hasattr(inp_module, 'is_quant_act_signed'):
-                is_unsigned_list.append(not inp_module.is_quant_act_signed)
+            elif hasattr(inp_module, 'input_quant'):
+                is_unsigned_list.append(not inp_module.input_quant.is_signed)
             else:
                 is_unsigned_list.append(False)
         elif inp_node.op == 'call_function':
-            if inp_node.target in [torch.reshape, torch.flatten, torch.transpose, CAT] + ADD_FNS:
+            if inp_node.target in [torch.reshape, torch.flatten, torch.transpose, torch.cat
+                                  ] + ADD_FNS:
                 are_inputs_unsigned(
                     model, inp_node, is_unsigned_list, quant_act_map, unsigned_act_tuple)
             else:
@@ -141,7 +140,7 @@ def are_inputs_quantized_and_aligned(model, node, quantized_modules_list, quant_
             if inp_node.target in [torch.reshape, torch.flatten, torch.transpose]:
                 are_inputs_quantized_and_aligned(
                     model, inp_node, quantized_modules_list, quant_act_map, same_sign)
-            elif inp_node.target is CAT:
+            elif inp_node.target is torch.cat:
                 are_inputs_quantized_and_aligned(
                     model, inp_node, quantized_modules_list, quant_act_map, True)
             elif inp_node.target in ADD_FNS:
@@ -281,7 +280,7 @@ def recursive_input_handler(
                 quant_identity_map,
                 align_input_quant_fn,
                 align_sign)
-        elif inp_node.op == 'call_function' and inp_node.target is CAT:
+        elif inp_node.op == 'call_function' and inp_node.target is torch.cat:
             recursive_input_handler(
                 model,
                 inp_node,
@@ -329,12 +328,12 @@ def residual_handler(
     def is_converged(model):
 
         for node in model.graph.nodes:
-            if (node.op == 'call_function' and node.target in ADD_FNS + [CAT] or
+            if (node.op == 'call_function' and node.target in ADD_FNS + [torch.cat] or
                     node.op == 'call_method' and node.target in ADD_METHODS):
                 rewriters = []
                 # If the op is CAT, check that inputs have same sign, and in recursive_input_handler
                 # force that the sign is aligned
-                same_sign = node.target is CAT
+                same_sign = node.target is torch.cat
 
                 # If input to the CAT or ADD node are quantized and aligned correctly, continue to
                 # the next node
@@ -504,7 +503,8 @@ def find_module(
         model: nn.Module,
         layer_map: Dict[nn.Module, Optional[Dict]],
         module_to_replace: List,
-        name_blacklist):
+        name_blacklist,
+        prefix=''):
     """
     Iterate through the model looking at immediate children of every module to look for supported modules.
     This allows us to stop the search when we meet a top-level module that is supported.
@@ -515,9 +515,10 @@ def find_module(
         module_to_replace.append(model)
     else:
         for name, module in model.named_children():
-            if name_blacklist is not None and name in name_blacklist:
+            full_name = prefix + '.' + name if prefix != '' else name
+            if name_blacklist is not None and full_name in name_blacklist:
                 continue
-            find_module(module, layer_map, module_to_replace, name_blacklist)
+            find_module(module, layer_map, module_to_replace, name_blacklist, full_name)
 
 
 def layerwise_layer_handler(

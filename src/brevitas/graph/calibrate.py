@@ -13,10 +13,9 @@ import torch.nn.functional as F
 from brevitas.nn import QuantHardTanh
 from brevitas.nn import QuantLinear
 from brevitas.nn.quant_layer import QuantWeightBiasInputOutputLayer as QuantWBIOL
-from brevitas.nn.utils import compute_channel_view_shape
-from brevitas.proxy.parameter_quant import BiasQuantProxyFromInjector
-from brevitas.proxy.parameter_quant import WeightQuantProxyFromInjector
-from brevitas.proxy.runtime_quant import ActQuantProxyFromInjector
+from brevitas.proxy.parameter_quant import BiasQuantProxyFromInjectorBase
+from brevitas.proxy.parameter_quant import WeightQuantProxyFromInjectorBase
+from brevitas.proxy.runtime_quant import ActQuantProxyFromInjectorBase
 from brevitas.proxy.runtime_quant import ClampQuantProxyFromInjector
 from brevitas.proxy.runtime_quant import TruncQuantProxyFromInjector
 from brevitas.quant_tensor import QuantTensor
@@ -24,11 +23,15 @@ from brevitas.quant_tensor import QuantTensor
 from .base import Transform
 
 __all__ = [
-    'ClipFloatWeights', 'DisableEnableQuantization', 'bias_correction_mode', 'calibration_mode']
+    'ClipFloatWeights',
+    'DisableEnableQuantization',
+    'bias_correction_mode',
+    'calibration_mode',
+    'load_quant_model_mode']
 
-_PARAM_PROXIES = (WeightQuantProxyFromInjector, BiasQuantProxyFromInjector)
+_PARAM_PROXIES = (WeightQuantProxyFromInjectorBase, BiasQuantProxyFromInjectorBase)
 
-_BIAS_PROXIES = (BiasQuantProxyFromInjector)
+_BIAS_PROXIES = (BiasQuantProxyFromInjectorBase)
 
 _ACC_PROXIES = (TruncQuantProxyFromInjector, ClampQuantProxyFromInjector)
 
@@ -42,6 +45,21 @@ _LAYERS_TO_CLIP = (
     nn.ConvTranspose3d)
 
 BN_LAYERS = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
+
+
+def disable_return_quant_tensor(model):
+    previous_state = {}
+    for module in model.modules():
+        if hasattr(module, 'return_quant_tensor'):
+            previous_state[module] = module.return_quant_tensor
+            module.return_quant_tensor = False
+    return previous_state
+
+
+def restore_return_quant_tensor(model, previous_state):
+    for module in model.modules():
+        if hasattr(module, 'return_quant_tensor') and module in previous_state:
+            module.return_quant_tensor = previous_state[module]
 
 
 def extend_collect_stats_steps(module):
@@ -71,11 +89,13 @@ class calibration_mode:
         self.previous_training_state = model.training
         self.disable_quant_inference = DisableEnableQuantization(call_act_quantizer_impl=True)
         self.enabled = enabled
+        self.return_quant_tensor_state = dict()
 
     def __enter__(self):
         if self.enabled:
             self.model.apply(extend_collect_stats_steps)
             self.model.apply(set_collect_stats_to_average)
+            self.return_quant_tensor_state = disable_return_quant_tensor(self.model)
             self.disable_quant_inference.apply(
                 self.model, is_training=True, quantization_enabled=False)
 
@@ -83,24 +103,52 @@ class calibration_mode:
         self.model.apply(finalize_collect_stats)
         self.disable_quant_inference.apply(
             self.model, is_training=self.previous_training_state, quantization_enabled=True)
+        restore_return_quant_tensor(self.model, self.return_quant_tensor_state)
 
 
 class bias_correction_mode:
 
-    def __init__(self, model, enabled=True):
+    def __init__(self, model, enabled=True, skip_if_no_bias=False):
         self.model = model
-        self.bias_correction = _BiasCorrection()
+        self.bias_correction = _BiasCorrection(skip_if_no_bias=skip_if_no_bias)
         self.enabled = enabled
         self.hooks = []
+        self.output_quant_modules = []
 
     def __enter__(self):
         if self.enabled:
+            for module in self.model.modules():
+                # Disable output quant so that the bias correction can be merged in the bias
+                if hasattr(module, 'output_quant') and module.output_quant.is_quant_enabled:
+                    self.bias_correction.disable_act_quantization(
+                        module.output_quant, is_training=False)
+                    self.output_quant_modules.append(module)
             self.bias_correction.register_hook_to_wbiol(self.model, self.hooks)
 
     def __exit__(self, type, value, traceback):
         self.bias_correction.apply_correction(self.model)
+        for module in self.output_quant_modules:
+            # Re-enable output quantization
+            self.bias_correction.enable_act_quantization(module.output_quant, is_training=False)
         for hook in self.hooks:
             hook.remove()
+
+
+class load_quant_model_mode:
+
+    def __init__(self, model):
+        self.model = model
+        self.tracked_modules = []
+
+    def __enter__(self):
+        for module in self.model.modules():
+            if issubclass(type(module), QuantWBIOL):
+                module._quant_load_model_mode = True
+
+    def __exit__(self, *args, **kwargs):
+        for module in self.model.modules():
+            if issubclass(type(module), QuantWBIOL):
+                module._quant_load_model_mode = False
 
 
 class ClipFloatWeights(Transform):
@@ -142,18 +190,19 @@ class DisableEnableQuantization(Transform):
         if isinstance(module.tracked_module_list[0], QuantHardTanh):
             inp = F.hardtanh(
                 inp, min_val=module.quant_injector.min_val, max_val=module.quant_injector.max_val)
-        return QuantTensor(value=inp, training=module.training)
+        return inp
 
     def disable_act_quantization(self, model, is_training):
         # If self.call_act_quantizer_impl is set to True, the quantization will be performed but the output
         # will be discarded through the hook. It is useful for collecting activation stats,
         # for example during activation calibration in PTQ
         for module in model.modules():
-            if isinstance(module, ActQuantProxyFromInjector):
+            if isinstance(module, ActQuantProxyFromInjectorBase):
                 module.train(is_training)
                 if self.call_act_quantizer_impl:
-                    hook = module.register_forward_hook(self.disable_act_quant_hook)
-                    self.disable_act_quant_hooks.append(hook)
+                    for m in module.modules():
+                        if hasattr(m, 'observer_only'):
+                            m.observer_only = True
                 else:
                     module.disable_quant = True
             elif isinstance(module, _ACC_PROXIES):
@@ -177,12 +226,12 @@ class DisableEnableQuantization(Transform):
             if isinstance(module, _ACC_PROXIES):
                 module.train(is_training)
                 module.disable_quant = False
-            elif isinstance(module, ActQuantProxyFromInjector):
+            elif isinstance(module, ActQuantProxyFromInjectorBase):
                 module.disable_quant = False
                 module.train(is_training)
-        for hook in self.disable_act_quant_hooks:
-            hook.remove()
-        self.disable_act_quant_hooks = []
+                for m in module.modules():
+                    if hasattr(m, 'observer_only'):
+                        m.observer_only = False
 
     def enable_param_quantization(self, model, is_training):
         for module in model.modules():
@@ -209,7 +258,7 @@ class _BiasCorrection(DisableEnableQuantization):
 
     LAYERS = (QuantWBIOL,)
 
-    def __init__(self, layers=LAYERS):
+    def __init__(self, layers=LAYERS, skip_if_no_bias=False):
         super(_BiasCorrection, self).__init__()
         self.layers = layers
         self.iterations = {}
@@ -217,6 +266,7 @@ class _BiasCorrection(DisableEnableQuantization):
         self.float_mean_map = {}
         self.collect_float_mean_hooks = []
         self.correct_bias_hooks = []
+        self.skip_if_no_bias = skip_if_no_bias
 
     def compute_mean(self, inp, transpose_dim):
         inp = inp.transpose(0, transpose_dim)
@@ -246,11 +296,18 @@ class _BiasCorrection(DisableEnableQuantization):
         for name, module in model.named_modules():
             if name in self.correction_map.keys():
                 correction = self.correction_map[name] / self.iterations[name]
+                # When accelerate is enabled, bring tensors onto the device to avoid allocating a meta parameter.
+                if hasattr(module, 'allocate_params'):
+                    module.allocate_params(module)
                 if module.bias is not None:
                     module.bias.data += correction
-                else:
+                elif self.skip_if_no_bias is False:
+                    # If accelerate is enabled, bias will be on the same execution device as the weights, but won't be managed properly by accelerate
                     module.register_parameter(
                         'bias', nn.Parameter(correction).to(module.weight.device))
+                # Offload params again
+                if hasattr(module, 'offload_params'):
+                    module.offload_params(module)
 
     def compute_correct_bias(self, module, inp, name):
         inp = self.unpack_input(inp)
@@ -292,14 +349,10 @@ class _BiasCorrection(DisableEnableQuantization):
         self.collect_float_mean(module, out_float, name)
         self.enable_act_quantization(module, is_training=False)
         self.enable_param_quantization(module, is_training=False)
-
-        # Compute quant output
-        # We need to disable output_quant while out_quant is being computed
-        # or we are going to apply bias correction on post quant values instead of pre quant
+        # Keep output quant disabled until further notice
         self.disable_act_quantization(module.output_quant, is_training=False)
-        out_quant = module.forward(*inp)  # Required to avoid infinite recursion
+        out_quant = output
         self.compute_correct_bias(module, out_quant, name)
-        self.enable_act_quantization(module.output_quant, is_training=False)
         self.iterations[name] += 1
         return out_float
 

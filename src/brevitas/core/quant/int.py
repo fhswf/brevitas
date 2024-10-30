@@ -145,15 +145,18 @@ class RescalingIntQuant(brevitas.jit.ScriptModule):
         self.int_scaling_impl = int_scaling_impl
         self.zero_point_impl = zero_point_impl
         self.msb_clamp_bit_width_impl = bit_width_impl
+        self.observer_only = brevitas.jit.Attribute(False, bool)
 
     @brevitas.jit.script_method
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         bit_width = self.msb_clamp_bit_width_impl()
-        threshold = self.scaling_impl(x)
         int_threshold = self.int_scaling_impl(bit_width)
-        scale = threshold / int_threshold
+        scale = self.scaling_impl(x, int_threshold)
         zero_point = self.zero_point_impl(x, scale, bit_width)
-        y = self.int_quant(scale, zero_point, bit_width, x)
+        if self.observer_only:
+            y = x
+        else:
+            y = self.int_quant(scale, zero_point, bit_width, x)
         return y, scale, zero_point, bit_width
 
 
@@ -176,6 +179,7 @@ class DecoupledRescalingIntQuant(brevitas.jit.ScriptModule):
         self.pre_zero_point_impl = pre_zero_point_impl
         self.zero_point_impl = zero_point_impl
         self.msb_clamp_bit_width_impl = bit_width_impl
+        self.observer_only = brevitas.jit.Attribute(False, bool)
 
     @brevitas.jit.script_method
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -184,10 +188,12 @@ class DecoupledRescalingIntQuant(brevitas.jit.ScriptModule):
         pre_threshold = self.pre_scaling_impl(x)
         pre_scale = pre_threshold / int_threshold
         pre_zero_point = self.pre_zero_point_impl(x, pre_scale, bit_width)
-        threshold = self.scaling_impl(x)
-        scale = threshold / int_threshold
+        scale = self.scaling_impl(x, int_threshold)
         zero_point = self.zero_point_impl(x, scale, bit_width)
-        y = self.decoupled_int_quant(pre_scale, pre_zero_point, scale, zero_point, bit_width, x)
+        if self.observer_only:
+            y = x
+        else:
+            y = self.decoupled_int_quant(pre_scale, pre_zero_point, scale, zero_point, bit_width, x)
         return y, scale, zero_point, bit_width, pre_scale, pre_zero_point
 
 
@@ -250,8 +256,10 @@ class DecoupledRescalingIntQuantWithInput(DecoupledRescalingIntQuant):
         pre_threshold = self.pre_scaling_impl(x, input_bit_width, input_is_signed)
         pre_scale = pre_threshold / int_threshold
         pre_zero_point = self.pre_zero_point_impl(x, pre_scale, bit_width)
-        threshold = self.scaling_impl(x)
-        scale = threshold / int_threshold
+        scale = self.scaling_impl(x, int_threshold)
         zero_point = self.zero_point_impl(x, scale, bit_width)
-        y = self.decoupled_int_quant(pre_scale, pre_zero_point, scale, zero_point, bit_width, x)
+        if self.observer_only:
+            y = x
+        else:
+            y = self.decoupled_int_quant(pre_scale, pre_zero_point, scale, zero_point, bit_width, x)
         return y, scale, zero_point, bit_width, pre_scale, pre_zero_point

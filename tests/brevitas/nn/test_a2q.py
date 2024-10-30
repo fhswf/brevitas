@@ -63,7 +63,11 @@ def calc_a2q_plus_acc_bit_width(
     return min_bit_width
 
 
-calc_fnc = {"quant_a2q": calc_a2q_acc_bit_width, "quant_a2q_plus": calc_a2q_plus_acc_bit_width}
+calc_fnc = {
+    "quant_a2q": calc_a2q_acc_bit_width,
+    "quant_a2q_per_tensor": calc_a2q_acc_bit_width,
+    "quant_a2q_plus": calc_a2q_plus_acc_bit_width,
+    "quant_a2q_plus_per_tensor": calc_a2q_plus_acc_bit_width}
 
 
 @pytest_cases.parametrize_with_cases('model_input', cases=case_model_a2q)
@@ -94,20 +98,33 @@ def test_quant_wbiol_a2q(model_input, current_cases):
 
     # the tensor quantizer requires a QuantTensor with specified bit-width and sign
     quant_weight = model.conv.quant_weight(quant_input)
+
+    # test that the scaling factor is per-tensor or per-channel
+    if kwargs['weight_quant'].endswith('per_tensor'):
+        assert quant_weight.scale.numel() == 1
+    else:
+        assert quant_weight.scale.numel() == model.conv.out_channels
+
     quant_weight = quant_weight.int().float()
     if kwargs['model_type'] == 'QuantLinear':  # shape = (out_features, in_features)
         quant_weight_per_channel_l1_norm = quant_weight.norm(p=1, dim=1)
     elif kwargs['model_type'] == 'QuantConv1d':  # shape = (out_channels, in_channels, kernel_size)
         quant_weight_per_channel_l1_norm = quant_weight.norm(p=1, dim=(1, 2))
     elif kwargs[
-            'model_type'] == 'QuantConv2d':  # shape = (out_channels, in_channels, kernel_size, kernel_size)
+            'model_type'] == 'QuantConv2d':  # shape = (out_channels, in_channels, kernel_height, kernel_width)
         quant_weight_per_channel_l1_norm = quant_weight.norm(p=1, dim=(1, 2, 3))
+    elif kwargs[
+            'model_type'] == 'QuantConv3d':  # shape = (out_channels, in_channels, kernel_depth, kernel_height, kernel_width)
+        quant_weight_per_channel_l1_norm = quant_weight.norm(p=1, dim=(1, 2, 3, 4))
     elif kwargs[
             'model_type'] == 'QuantConvTranspose1d':  # shape = (in_channels, out_channels, kernel_size)
         quant_weight_per_channel_l1_norm = quant_weight.norm(p=1, dim=(0, 2))
     elif kwargs[
-            'model_type'] == 'QuantConvTranspose2d':  # shape = (in_channels, out_channels, kernel_size)
+            'model_type'] == 'QuantConvTranspose2d':  # shape = (in_channels, out_channels, kernel_height, kernel_width)
         quant_weight_per_channel_l1_norm = quant_weight.norm(p=1, dim=(0, 2, 3))
+    elif kwargs[
+            'model_type'] == 'QuantConvTranspose3d':  # shape = (in_channels, out_channels, kernel_depth, kernel_height, kernel_width)
+        quant_weight_per_channel_l1_norm = quant_weight.norm(p=1, dim=(0, 2, 3, 4))
     else:
         raise NotImplementedError(f"Check for {kwargs['model_type']} is not yet implemented.")
 

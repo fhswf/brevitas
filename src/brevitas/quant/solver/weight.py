@@ -3,12 +3,14 @@
 
 from brevitas.core.quant import *
 from brevitas.core.quant import QuantType
+from brevitas.core.scaling import ScalingPerOutputType
 from brevitas.inject import ExtendedInjector
 from brevitas.inject import this
 from brevitas.inject import value
 from brevitas.proxy import WeightQuantProxyFromInjector
 from brevitas.quant.solver.common import *
 from brevitas.quant.solver.parameter import *
+from brevitas.quant.solver.parameter import SolveInputViewImpl
 
 __all__ = [
     'SolveWeightTensorQuantFromEnum',
@@ -62,11 +64,11 @@ class SolveWeightScalingStatsInputDimsFromModule(ExtendedInjector):
     #  such that output channels are dim 0 and the remaining features are dim 1,
     #  along which we concatenate
     @value
-    def scaling_stats_input_concat_dim(scaling_per_output_channel):
-        if scaling_per_output_channel:
-            return 1
-        else:
+    def scaling_stats_input_concat_dim(scaling_per_output):
+        if scaling_per_output == ScalingPerOutputType.TENSOR:
             return 0
+        elif scaling_per_output == ScalingPerOutputType.CHANNEL:
+            return 1
 
     @value
     def permute_dims(module, output_channel_dim):
@@ -88,9 +90,9 @@ class SolveWeightScalingStatsInputDimsFromModule(ExtendedInjector):
         return module.output_channel_dim
 
 
-class WeightQuantSolver(SolveWeightScalingStatsInputDimsFromModule,
+class WeightQuantSolver(SolveStatsReduceDimFromEnum,
+                        SolveWeightScalingStatsInputDimsFromModule,
                         SolveScalingStatsInputViewShapeImplFromEnum,
-                        SolveStatsReduceDimFromEnum,
                         SolveScalingStatsOpFromEnum,
                         SolveBitWidthImplFromEnum,
                         SolveTensorQuantFloatToIntImplFromEnum,
@@ -102,7 +104,8 @@ class WeightQuantSolver(SolveWeightScalingStatsInputDimsFromModule,
                         SolveParameterScalingShape,
                         SolveWeightScalingPerOutputChannelShapeFromModule,
                         SolveWeightTensorQuantFromEnum,
-                        SolveDtypeDeviceFromTrackedParameterList):
+                        SolveDtypeDeviceFromTrackedParameterList,
+                        SolveInputViewImpl):
     """
     Translate enum and shape directives to weight-specific quantization core modules.
     It should be placed last in the list of classes a quantizer inherits from,

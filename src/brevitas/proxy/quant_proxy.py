@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from abc import ABCMeta
-from abc import abstractmethod
 from typing import Optional
 
 from torch import nn
@@ -12,6 +11,7 @@ from typing_extensions import runtime_checkable
 
 from brevitas import config
 from brevitas.common import ExportMixin
+from brevitas.core.scaling import ScalingPerOutputType
 from brevitas.core.utils import StatelessBuffer
 from brevitas.inject import BaseInjector as Injector
 from brevitas.utils.quant_utils import float_to_int_impl_to_enum
@@ -22,16 +22,7 @@ __all__ = [
 
 
 def _is_groupwise(quant_injector):
-    if 'group_size' in quant_injector:
-        return True
-    else:
-        return False
-
-
-def _is_signed(quant_injector):
-    if 'signed' in quant_injector:
-        return quant_injector.signed
-    return None
+    return 'scaling_per_output' in quant_injector and quant_injector.scaling_per_output == ScalingPerOutputType.GROUP
 
 
 def _is_narrow_range(quant_injector):
@@ -88,6 +79,8 @@ class QuantProxyFromInjector(ExportMixin, nn.Module, QuantProxyProtocol):
         self.tracked_module_list = []
         self.add_tracked_module(quant_layer)
         self.disable_quant = False
+        # Torch.compile compatibility requires this
+        self.is_signed = quant_injector.signed if 'signed' in quant_injector else None
 
     @property
     def requires_export_handler(self):
@@ -109,10 +102,6 @@ class QuantProxyFromInjector(ExportMixin, nn.Module, QuantProxyProtocol):
         return not self.disable_quant and self.tensor_quant is not None
 
     @property
-    def is_signed(self):
-        return _is_signed(self.quant_injector)
-
-    @property
     def is_groupwise(self):
         return _is_groupwise(self.quant_injector)
 
@@ -131,6 +120,9 @@ class QuantProxyFromInjector(ExportMixin, nn.Module, QuantProxyProtocol):
             self.init_tensor_quant()
         else:
             raise RuntimeError("Trying to add None as a parent module.")
+
+    def apply_input_view(self, x):
+        return self.input_view_impl(x)
 
     def _load_from_state_dict(
             self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,

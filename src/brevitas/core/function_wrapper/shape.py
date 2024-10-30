@@ -16,6 +16,7 @@ from brevitas.function.shape import over_batch_over_tensor
 from brevitas.function.shape import over_output_channels
 from brevitas.function.shape import over_output_features
 from brevitas.function.shape import over_tensor
+from brevitas.utils.torch_utils import padding
 
 
 class PermuteDims(brevitas.jit.ScriptModule):
@@ -153,6 +154,54 @@ class OverOutputFeaturesView(brevitas.jit.ScriptModule):
         return y.reshape(shape)
 
 
+class OverSubChannelBlockView(brevitas.jit.ScriptModule):
+    __constants__ = ['expanded_groupwise_shape', 'group_size', 'group_dim']
+
+    def __init__(self, expanded_groupwise_shape, group_size, group_dim) -> None:
+        super(OverSubChannelBlockView, self).__init__()
+        self.expanded_groupwise_shape = expanded_groupwise_shape
+        self.group_dim = group_dim
+        self.group_size = group_size
+
+    @brevitas.jit.script_method
+    def forward(self, x: torch.Tensor):
+        # This one is a bit tricky but we could end up here:
+        # - If we quantize the zero point, which will already have expanded shape matching the scale (although no padding, but we don't need the padding)
+        # - Groupwise HQO quantization, where weight will already have been padded and expanded
+        if len(x.shape) == len(self.expanded_groupwise_shape):
+            return x
+        y = torch.nn.functional.pad(
+            x, padding(x, self.group_size, self.group_dim), mode='constant', value=0.)
+        y = y.view(self.expanded_groupwise_shape)
+        return y
+
+
+class DynamicOverSubChannelBlockView(brevitas.jit.ScriptModule):
+    __constants__ = ['group_size', 'group_dim']
+
+    def __init__(self, group_size, group_dim) -> None:
+        super(DynamicOverSubChannelBlockView, self).__init__()
+        self.group_size = group_size
+        self.group_dim = group_dim
+
+    @brevitas.jit.script_method
+    def forward(self, x):
+
+        tensor_shape = x.shape
+        tensor_shape_list = list(tensor_shape)
+        pad = padding(x, self.group_size, self.group_dim)
+
+        x = torch.nn.functional.pad(x, pad, mode='constant', value=0.)
+
+        tensor_shape = x.shape
+        tensor_shape_list = list(tensor_shape)
+        tensor_shape_list[self.group_dim] = int(tensor_shape_list[self.group_dim] / self.group_size)
+        block_dim = self.group_dim + 1 if self.group_dim != -1 else -1
+        tensor_shape_list.insert(block_dim, self.group_size)
+        x = x.view(tensor_shape_list)
+        return x
+
+
 class StatsInputViewShapeImpl(object):
     """
     Enum-like object to collect pointers to variants of ScriptModules that perform a view on a tensor.
@@ -163,3 +212,5 @@ class StatsInputViewShapeImpl(object):
     OVER_BATCH_OVER_TENSOR = OverBatchOverTensorView
     OVER_BATCH_OVER_OUTPUT_CHANNELS = OverBatchOverOutputChannelView
     OVER_OUTPUT_FEATURES = OverOutputFeaturesView
+    OVER_SUBCHANNEL_BLOCK = OverSubChannelBlockView
+    DYNAMIC_OVER_SUBCHANNEL_BLOCK = DynamicOverSubChannelBlockView

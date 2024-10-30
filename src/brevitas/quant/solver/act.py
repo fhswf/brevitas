@@ -1,10 +1,14 @@
 # Copyright (C) 2023, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
+from warnings import warn
+
 import torch
 from torch import nn
 from torch import Tensor
 
+from brevitas.core.function_wrapper.misc import Identity
+from brevitas.core.function_wrapper.shape import StatsInputViewShapeImpl
 from brevitas.core.quant import ClampedBinaryQuant
 from brevitas.core.quant import RescalingIntQuant
 from brevitas.core.quant import TernaryQuant
@@ -18,6 +22,7 @@ from brevitas.inject import this
 from brevitas.inject import value
 from brevitas.inject.enum import QuantType
 from brevitas.inject.enum import ScalingImplType
+from brevitas.inject.enum import ScalingPerOutputType
 from brevitas.proxy import ActQuantProxyFromInjector
 from brevitas.proxy.utils import ConvertRuntimeStatsToParameter
 from brevitas.quant.solver.common import *
@@ -100,13 +105,40 @@ class SolveActScalingInitFromEnum(ExtendedInjector):
 class SolveActScalingShape(ExtendedInjector):
 
     @value
-    def scaling_shape(scaling_per_output_channel):
+    def scaling_shape(scaling_per_output):
         # this pattern of returning this.something allows to resolve scaling_output_channel_shape
         # only when scaling_per_output_channel is True
-        if scaling_per_output_channel:
+        if scaling_per_output == ScalingPerOutputType.CHANNEL:
             return this.per_channel_broadcastable_shape
-        else:
+        elif scaling_per_output == ScalingPerOutputType.TENSOR:
             return SCALAR_SHAPE
+
+    @value
+    def group_dim(module=None, group_size=None):
+        # Avoid circular import
+        from brevitas.nn.quant_layer import QuantWeightBiasInputOutputLayer
+
+        if group_size is not None and module is not None:
+            if isinstance(module, QuantWeightBiasInputOutputLayer):
+                if isinstance(module, nn.Linear):
+                    return -1
+                elif isinstance(module,
+                                (nn.Conv1d,
+                                 nn.Conv2d,
+                                 nn.Conv3d,
+                                 nn.ConvTranspose1d,
+                                 nn.ConvTranspose2d,
+                                 nn.ConvTranspose3d)):
+                    warn(
+                        "Group dim is being selected assuming batched input. Using unbatched input will fail and requires manually specification of group_dim"
+                    )
+                    # We are assuming batched input
+                    return 1
+                else:
+                    raise RuntimeError("Cannot determine automatically group_dim. Please specify")
+            else:
+                raise RuntimeError(
+                    f"Cannot determine automatically group_dim for {type(module)}. Please specify")
 
 
 class SolveActScalingPerOutputChannelShape(ExtendedInjector):
@@ -127,6 +159,16 @@ class SolveUpdateStateDictImplFromEnum(ExtendedInjector):
             return None
 
 
+class SolveInputViewImpl(ExtendedInjector):
+
+    @value
+    def input_view_impl(scaling_per_output):
+        if scaling_per_output == ScalingPerOutputType.GROUP:
+            return StatsInputViewShapeImpl.DYNAMIC_OVER_SUBCHANNEL_BLOCK
+        else:
+            return Identity
+
+
 class ActQuantSolver(SolveActTensorQuantFromEnum,
                      SolveActScalingImplFromEnum,
                      SolveIntScalingImplFromEnum,
@@ -139,7 +181,8 @@ class ActQuantSolver(SolveActTensorQuantFromEnum,
                      SolveActScalingShape,
                      SolveScalingStatsInputViewShapeImplFromEnum,
                      SolveActScalingPerOutputChannelShape,
-                     SolveUpdateStateDictImplFromEnum):
+                     SolveUpdateStateDictImplFromEnum,
+                     SolveInputViewImpl):
     """
     Translate enum directives to activation-specific quantization core modules.
     It should be placed last in the list of classes a quantizer inherits from,

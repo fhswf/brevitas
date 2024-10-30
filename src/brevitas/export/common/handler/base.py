@@ -4,6 +4,7 @@
 from abc import ABC
 from abc import abstractmethod
 import math
+from warnings import warn
 
 import torch
 from torch import Tensor
@@ -12,7 +13,8 @@ from torch.nn import Module
 from brevitas.function.ops import max_int
 from brevitas.function.ops import min_int
 
-__all__ = ['BaseHandler', 'BitWidthHandlerMixin', 'ZeroPointHandlerMixin']
+__all__ = [
+    'BaseHandler', 'BitWidthHandlerMixin', 'ZeroPointHandlerMixin', 'FloatZeroPointHandlerMixin']
 
 
 class BaseHandler(Module, ABC):
@@ -35,6 +37,13 @@ class QuantAxisMixin(ABC):
         for i, s in enumerate(scale.shape):
             if s != 1:
                 return i
+        return None
+
+
+class FloatClipMixin(ABC):
+
+    @classmethod
+    def clip_symbolic_kwargs(cls, narrow, signed, exponent_bit_width, mantissa_bit_width):
         return None
 
 
@@ -112,6 +121,25 @@ class ScaleHandlerMixin(ABC):
         return -cls.validate_scalar_int_exponent(scale)
 
 
+class FloatZeroPointHandlerMixin(ABC):
+
+    @classmethod
+    def zero_point_with_dtype(
+            cls, exponent_bit_width, mantissa_bit_width, is_ocp, is_fnuz, zero_point):
+        if is_ocp:
+            if exponent_bit_width == 4 and mantissa_bit_width == 3:
+                return zero_point.type(torch.float8_e4m3fn)
+            elif exponent_bit_width == 5 and mantissa_bit_width == 2:
+                return zero_point.type(torch.float8_e5m2)
+        elif is_fnuz:
+            if exponent_bit_width == 4 and mantissa_bit_width == 3:
+                return zero_point.type(torch.float8_e4m3fnuz)
+            elif exponent_bit_width == 5 and mantissa_bit_width == 2:
+                return zero_point.type(torch.float8_e5m2fnuz)
+        else:
+            raise NotImplementedError
+
+
 class ZeroPointHandlerMixin(ABC):
 
     @classmethod
@@ -127,24 +155,3 @@ class ZeroPointHandlerMixin(ABC):
                 return zero_point.type(torch.int8)
             else:
                 return zero_point.type(torch.int32)
-
-    @classmethod
-    def quant_input_zero_point(cls, module):
-        signed = module.is_quant_input_signed
-        zero_point = module.quant_input_zero_point()
-        bit_width = module.quant_input_bit_width()
-        return cls.zero_point_with_dtype(signed, bit_width, zero_point)
-
-    @classmethod
-    def quant_weight_zero_point(cls, module):
-        signed = module.is_quant_weight_signed
-        zero_point = module.quant_weight_zero_point()
-        bit_width = module.quant_weight_bit_width()
-        return cls.zero_point_with_dtype(signed, bit_width, zero_point)
-
-    @classmethod
-    def quant_output_zero_point(cls, module):
-        signed = module.is_quant_output_signed
-        zero_point = module.quant_output_zero_point()
-        bit_width = module.quant_output_bit_width()
-        return cls.zero_point_with_dtype(signed, bit_width, zero_point)

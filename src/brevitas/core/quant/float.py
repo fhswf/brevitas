@@ -1,7 +1,7 @@
 # Copyright (C) 2023, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -10,12 +10,11 @@ import brevitas
 from brevitas.core.function_wrapper import RoundSte
 from brevitas.core.scaling import ConstScaling
 from brevitas.core.utils import StatelessBuffer
-from brevitas.function.ops import max_float
-from brevitas.function.ops_ste import floor_ste
+from brevitas.utils.torch_utils import float_internal_scale
 
 
 class FloatQuant(brevitas.jit.ScriptModule):
-    __constants__ = ['signed']
+    __constants__ = ['signed', 'eps']
 
     def __init__(
             self,
@@ -23,7 +22,9 @@ class FloatQuant(brevitas.jit.ScriptModule):
             signed: bool,
             exponent_bit_width: int,
             mantissa_bit_width: int,
-            exponent_bias: Optional[int] = None,
+            exponent_bias: int,
+            float_clamp_impl: nn.Module,
+            input_view_impl: nn.Module,
             scaling_impl: Optional[nn.Module] = None,
             float_scaling_impl: Optional[nn.Module] = None,
             float_to_int_impl: nn.Module = RoundSte(),
@@ -43,40 +44,35 @@ class FloatQuant(brevitas.jit.ScriptModule):
             raise RuntimeError("Mantissa bit width cannot be 0.")
         self.mantissa_bit_width = StatelessBuffer(
             (torch.tensor(float(mantissa_bit_width), device=device, dtype=dtype)))
-        if exponent_bias is None:
-            exponent_bias = 2 ** (exponent_bit_width - 1) - 1
         self.exponent_bias = StatelessBuffer(
             torch.tensor(float(exponent_bias), device=device, dtype=dtype))
-        self.fp_max_val = StatelessBuffer(
-            max_float(self.exponent_bit_width(), self.mantissa_bit_width(), self.exponent_bias()))
+
         self.fp_internal_scale_min = StatelessBuffer(
             1. - self.exponent_bias() - self.mantissa_bit_width())
-        if float_scaling_impl is None:
-            float_scaling_impl = ConstScaling(1., device=device, dtype=dtype)
+
         if scaling_impl is None:
             scaling_impl = ConstScaling(1., device=device, dtype=dtype)
+
+        self.input_view_impl = input_view_impl
         # Zero-point is currently hardcoded to 0
         self.zero_point_impl = StatelessBuffer(torch.tensor(0., device=device, dtype=dtype))
         self.float_scaling_impl = float_scaling_impl
         self.scaling_impl = scaling_impl
+        self.float_clamp_impl = float_clamp_impl
+
+        # To avoid log(0), we add small a small value based on the used dtype
+        if dtype is None:
+            dtype = torch.get_default_dtype()
+        self.eps = torch.finfo(dtype).tiny
+        self.observer_only = brevitas.jit.Attribute(False, bool)
 
     @brevitas.jit.script_method
-    def internal_scale(self, x):
-        internal_scale = floor_ste(torch.log2(torch.abs(x))) - self.mantissa_bit_width()
-        internal_scale = torch.clamp_min(internal_scale, self.fp_internal_scale_min())
-        internal_scale = torch.exp2(internal_scale)
-        return internal_scale
-
-    @brevitas.jit.script_method
-    def quantize(self, x: torch.Tensor):
-        scale = self.scaling_impl(x) / self.float_scaling_impl(x)
+    def quantize(self, x: torch.Tensor, scale: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.input_view_impl(x)
         scaled_x = x / scale
-        internal_scale = self.internal_scale(scaled_x)
+        internal_scale = float_internal_scale(
+            scaled_x, self.mantissa_bit_width(), self.fp_internal_scale_min(), self.eps)
         val_fp_quant = internal_scale * self.float_to_int_impl(scaled_x / internal_scale)
-        if self.signed:
-            val_fp_quant = torch.clip(val_fp_quant, -1. * self.fp_max_val(), self.fp_max_val())
-        else:
-            val_fp_quant = torch.clip(val_fp_quant, 0., self.fp_max_val())
         return val_fp_quant, scale
 
     @brevitas.jit.script_method
@@ -85,7 +81,20 @@ class FloatQuant(brevitas.jit.ScriptModule):
 
     @brevitas.jit.script_method
     def forward(self, x):
-        y, scale = self.quantize(x)
-        y = self.dequantize(y, scale)
+        if self.float_scaling_impl is not None:
+            float_scaling_impl_value = self.float_scaling_impl(
+                self.exponent_bit_width(), self.mantissa_bit_width(), self.exponent_bias())
+        else:
+            float_scaling_impl_value = None
+        scale = self.scaling_impl(x, float_scaling_impl_value)
+        if self.observer_only:
+            y = x
+            saturating, inf_values, nan_values = self.float_clamp_impl.saturating, self.float_clamp_impl.inf_values, self.float_clamp_impl.nan_values
+        else:
+            y, scale = self.quantize(x, scale)
+            # after quantizing, clamp to special cases like NaN/inf if they are set
+            y, saturating, inf_values, nan_values = self.float_clamp_impl(
+                y, self.exponent_bit_width(), self.mantissa_bit_width(), self.exponent_bias())
+            y = self.dequantize(y, scale)
         # This is to respect the current interface of proxies
-        return y, scale, self.zero_point_impl(), self.bit_width()
+        return y, scale, self.zero_point_impl(), self.exponent_bit_width(), self.mantissa_bit_width(), self.exponent_bias(), saturating, inf_values, nan_values

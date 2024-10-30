@@ -1,9 +1,9 @@
-import csv
-
 import torch
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 from tqdm import tqdm
+
+from brevitas.quant_tensor import QuantTensor
 
 SEED = 123456
 
@@ -81,6 +81,8 @@ def validate(val_loader, model, stable=True):
             images = images.to(dtype)
 
             output = model(images)
+            if isinstance(output, QuantTensor):
+                output = output.value
             # measure accuracy
             acc1, = accuracy(output, target, stable=stable)
             top1.update(acc1[0], images.size(0))

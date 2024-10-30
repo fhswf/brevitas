@@ -3,13 +3,14 @@
 
 from functools import reduce
 from operator import mul
-import os
 
+from packaging.version import parse
 import pytest
 from pytest_cases import get_case_id
 from pytest_cases import parametrize_with_cases
 import torch
 
+from brevitas import torch_version
 from tests.marker import requires_pt_ge
 
 from .common import *
@@ -19,8 +20,8 @@ from .quant_module_cases import QuantWBIOLCases
 
 
 @parametrize_with_cases('model', cases=QuantWBIOLCases)
-@pytest.mark.parametrize('export_type', ['qcdq', 'qonnx', 'qop'])
-@requires_pt_ge('1.8.1')
+@pytest.mark.parametrize('export_type', ['qcdq', 'qonnx'])
+@requires_pt_ge('1.10')
 def test_ort_wbiol(model, export_type, current_cases):
     cases_generator_func = current_cases['model'][1]
     case_id = get_case_id(cases_generator_func)
@@ -29,9 +30,8 @@ def test_ort_wbiol(model, export_type, current_cases):
     quantizer = case_id.split('-')[-6]
     o_bit_width = case_id.split('-')[-5]
     i_bit_width = case_id.split('-')[-3]
-
-    if impl in ('QuantConvTranspose1d', 'QuantConvTranspose2d') and export_type == 'qop':
-        pytest.skip('Export of ConvTranspose is not supported for QOperation')
+    onnx_opset = 14
+    export_q_weight = False
     if 'per_channel' in quantizer and 'asymmetric' in quantizer:
         pytest.skip('Per-channel zero-point is not well supported in ORT.')
     if 'QuantLinear' in impl and 'asymmetric' in quantizer:
@@ -39,13 +39,24 @@ def test_ort_wbiol(model, export_type, current_cases):
     if 'dynamic' in quantizer and ((o_bit_width != "o8" or i_bit_width != "i8") or
                                    export_type != "qcdq"):
         pytest.skip('Dynamic Act Quant supported only for 8bit and QCDQ export')
+    if export_type == 'qonnx' and 'fp8' in quantizer:
+        pytest.skip('FP8 export requires QCDQ')
+    if torch_version < parse('2.1') and 'fp8' in quantizer:
+        pytest.skip('FP8 requires PyTorch 2.1 or higher')
+    elif torch_version >= parse('2.1') and 'fp8' in quantizer:
+        onnx_opset = 19
+        export_q_weight = True
 
     if impl in ('QuantLinear'):
         in_size = (1, IN_CH)
     elif impl in ('QuantConv1d', 'QuantConvTranspose1d'):
         in_size = (1, IN_CH, FEATURES)
-    else:
+    elif impl in ('QuantConv2d', 'QuantConvTranspose2d'):
         in_size = (1, IN_CH, FEATURES, FEATURES)
+    elif impl in ('QuantConv3d', 'QuantConvTranspose3d'):
+        in_size = (1, IN_CH, FEATURES, FEATURES, FEATURES)
+    else:
+        raise RuntimeError("Unsupported operation")
 
     inp = gen_linspaced_data(reduce(mul, in_size), -1, 1).reshape(in_size)
 
@@ -53,11 +64,18 @@ def test_ort_wbiol(model, export_type, current_cases):
     model.eval()
     export_name = f'qcdq_qop_export_{case_id}.onnx'
     assert is_brevitas_ort_close(
-        model, inp, export_name, export_type, tolerance=INT_TOLERANCE, first_output_only=True)
+        model,
+        inp,
+        export_name,
+        export_type,
+        tolerance=INT_TOLERANCE,
+        first_output_only=True,
+        onnx_opset=onnx_opset,
+        export_q_weight=export_q_weight)
 
 
 @parametrize_with_cases('model', cases=QuantAvgPoolCases)
-@requires_pt_ge('1.8.1')
+@requires_pt_ge('1.10')
 def test_ort_avgpool(model, current_cases):
     in_size = (1, IN_CH, FEATURES, FEATURES)
     inp = gen_linspaced_data(reduce(mul, in_size), -1, 1).reshape(in_size)
@@ -69,7 +87,7 @@ def test_ort_avgpool(model, current_cases):
 
 
 @parametrize_with_cases('model', cases=QuantRecurrentCases)
-@pytest.mark.parametrize('export_type', ['qcdq_opset14', 'qonnx_opset14'])
+@pytest.mark.parametrize('export_type', ['qcdq', 'qonnx_opset14'])
 @requires_pt_ge('1.10')
 def test_ort_lstm(model, export_type, current_cases):
     cases_generator_func = current_cases['model'][1]

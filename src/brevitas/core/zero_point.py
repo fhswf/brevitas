@@ -281,8 +281,9 @@ class ParameterFromStatsFromParameterZeroPoint(brevitas.jit.ScriptModule):
         output_dict = super(ParameterFromStatsFromParameterZeroPoint, self).state_dict(
             destination=destination, prefix=prefix, keep_vars=keep_vars)
         # Avoid saving the init value
-        if not self.init_done:
+        if not self.init_done and not config._FULL_STATE_DICT:
             del output_dict[prefix + 'value']
+        return output_dict
 
     def _load_from_state_dict(
             self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,

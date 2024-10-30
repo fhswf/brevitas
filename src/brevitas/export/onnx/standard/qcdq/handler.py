@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from abc import ABC
+from warnings import warn
 
 import torch
 
@@ -10,6 +11,9 @@ from brevitas.export.common.handler.qcdq import CDQCastMixin
 from brevitas.export.common.handler.qcdq import DQCastMixin
 from brevitas.export.common.handler.qcdq import DynamicQDQCastActQuantProxyHandlerMixin
 from brevitas.export.common.handler.qcdq import DynamicQMixin
+from brevitas.export.common.handler.qcdq import FloatQCDQCastActQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import FloatQCDQCastWeightQuantProxyHandlerMixin
+from brevitas.export.common.handler.qcdq import FloatQMixin
 from brevitas.export.common.handler.qcdq import QCDQCastActQuantProxyHandlerMixin
 from brevitas.export.common.handler.qcdq import QCDQCastDecoupledWeightQuantProxyHandlerMixin
 from brevitas.export.common.handler.qcdq import \
@@ -19,6 +23,7 @@ from brevitas.export.common.handler.qcdq import QCDQCastWeightQuantProxyHandlerM
 from brevitas.export.common.handler.qcdq import QMixin
 from brevitas.export.onnx.handler import ONNXBaseHandler
 from brevitas.export.onnx.handler import QuantLSTMLayerHandler
+from brevitas.inject.enum import ScalingPerOutputType
 
 from ..function import CastFn
 from ..function import DequantizeLinearFn
@@ -47,10 +52,33 @@ class StdDQCastONNXMixin(DQCastMixin, ABC):
         assert module.bit_width() > 1., 'Binary quant not supported'
 
 
+class StdFloatDQCastONNXMixin(StdDQCastONNXMixin, ABC):
+
+    def validate(self, module):
+        assert module.is_ocp or module.is_fnuz, 'Only OCP/FNUZ Standard are supported for FP8 export'
+
+
+class StdFloatCDQCastONNXMixin(CDQCastMixin, StdFloatDQCastONNXMixin, ABC):
+
+    def clip_fn(self, x, min_val, max_val):
+        raise NotImplementedError
+
+
 class StdCDQCastONNXMixin(CDQCastMixin, StdDQCastONNXMixin, ABC):
 
     def clip_fn(self, x, min_val, max_val):
         return IntClipFn.apply(x, min_val, max_val)
+
+
+class StdFloatQCDQCastONNXMixin(FloatQMixin, StdFloatCDQCastONNXMixin, ABC):
+
+    def validate(self, module):
+        if getattr(self, '_export_q_node', True):
+            assert module.rounding_mode.upper() == 'ROUND', 'Only round to nearest even supported'
+        super().validate(module)
+
+    def quantize_fn(self, x, scale, zero_point, dtype, axis):
+        return QuantizeLinearFn.apply(x, scale, zero_point, dtype, axis)
 
 
 class StdQCDQCastONNXMixin(QMixin, StdCDQCastONNXMixin, ABC):
@@ -106,10 +134,16 @@ class StdDynamicQDQCastONNXMixin(DynamicQMixin, StdDQCastONNXMixin, ABC):
         # Below 8b quantization is not supported.
         self.validate_8b_bit_width(module.bit_width(), le_then=False)
         # Only per tensor quantization is supported
-        assert not module.quant_injector.scaling_per_output_channel, "Only per tensor scaling supported"
+        assert module.quant_injector.scaling_per_output == ScalingPerOutputType.TENSOR, "Only per tensor scaling supported"
 
     def quantize_fn(self, x, dtype):
         return DynamicQuantizeLinearFn.apply(x, dtype)
+
+
+class StdFloatQCDQCastONNXWeightQuantProxyHandler(StdFloatQCDQCastONNXMixin,
+                                                  FloatQCDQCastWeightQuantProxyHandlerMixin,
+                                                  ONNXBaseHandler):
+    _export_q_node = False
 
 
 class StdQCDQCastONNXWeightQuantProxyHandler(StdQCDQCastONNXMixin,
@@ -128,6 +162,12 @@ class StdQCDQCastONNXDecoupledWeightQuantWithInputProxyHandler(
         StdQCDQCastONNXMixin, QCDQCastDecoupledWeightQuantWithInputProxyHandlerMixin,
         ONNXBaseHandler):
     _export_q_node = False
+
+
+class StdFloatQCDQCastONNXActQuantProxyHandler(StdFloatQCDQCastONNXMixin,
+                                               FloatQCDQCastActQuantProxyHandlerMixin,
+                                               ONNXBaseHandler):
+    pass
 
 
 class StdQCDQCastONNXActQuantProxyHandler(StdQCDQCastONNXMixin,

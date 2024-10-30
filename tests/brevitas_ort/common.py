@@ -10,13 +10,16 @@ from qonnx.transformation.infer_shapes import InferShapes
 import torch
 
 from brevitas.export import export_onnx_qcdq
-from brevitas.export import export_onnx_qop
 from brevitas.export import export_qonnx
 from brevitas.nn import QuantConv1d
 from brevitas.nn import QuantConv2d
+from brevitas.nn import QuantConv3d
 from brevitas.nn import QuantConvTranspose1d
 from brevitas.nn import QuantConvTranspose2d
+from brevitas.nn import QuantConvTranspose3d
 from brevitas.nn import QuantLinear
+from brevitas.quant.experimental.float_quant_ocp import Fp8e4m3OCPActPerTensorFloat
+from brevitas.quant.experimental.float_quant_ocp import Fp8e4m3OCPWeightPerTensorFloat
 from brevitas.quant.fixed_point import Int8ActPerTensorFixedPoint
 from brevitas.quant.fixed_point import Int8WeightPerChannelFixedPoint
 from brevitas.quant.fixed_point import Int8WeightPerTensorFixedPoint
@@ -27,6 +30,7 @@ from brevitas.quant.scaled_int import Int8WeightPerTensorFloat
 from brevitas.quant.shifted_scaled_int import ShiftedUint8ActPerTensorFloat
 from brevitas.quant.shifted_scaled_int import ShiftedUint8WeightPerChannelFloat
 from brevitas.quant.shifted_scaled_int import ShiftedUint8WeightPerTensorFloat
+from brevitas.quant_tensor import QuantTensor
 from brevitas_examples.common.generative.quantizers import ShiftedUint8DynamicActPerTensorFloat
 
 SEED = 123456
@@ -57,7 +61,8 @@ WBIOL_QUANTIZERS = {
     'symmetric_per_channel_fixed_point':
         (Int8WeightPerChannelFixedPoint, Int8ActPerTensorFixedPoint),
     'weight_symmetric_activation_dynamic_asymmetric_per_tensor_float':
-        (Int8WeightPerTensorFloat, ShiftedUint8DynamicActPerTensorFloat)}
+        (Int8WeightPerTensorFloat, ShiftedUint8DynamicActPerTensorFloat),
+    'fp8_ocp_per_tensor_float': (Fp8e4m3OCPWeightPerTensorFloat, Fp8e4m3OCPActPerTensorFloat)}
 LSTM_QUANTIZERS = {
     'asymmetric_per_tensor_float':
         (ShiftedUint8WeightPerTensorFloat, ShiftedUint8ActPerTensorFloat),
@@ -69,7 +74,13 @@ LSTM_QUANTIZERS = {
     'symmetric_per_channel_fixed_point':
         (Int8WeightPerChannelFixedPoint, Int8ActPerTensorFixedPoint)}
 QUANT_WBIOL_IMPL = [
-    QuantLinear, QuantConv1d, QuantConv2d, QuantConvTranspose1d, QuantConvTranspose2d]
+    QuantLinear,
+    QuantConv1d,
+    QuantConv2d,
+    QuantConv3d,
+    QuantConvTranspose1d,
+    QuantConvTranspose2d,
+    QuantConvTranspose3d,]
 
 
 def compute_ort(export_name, np_input):
@@ -112,13 +123,26 @@ def recursive_allclose(ort_output, brevitas_output, tolerance):
 
 
 def is_brevitas_ort_close(
-        model, np_input, export_name, export_type, tolerance=None, first_output_only=False):
+        model,
+        np_input,
+        export_name,
+        export_type,
+        tolerance=None,
+        first_output_only=False,
+        onnx_opset=14,
+        export_q_weight=False):
     input_t = torch.from_numpy(np_input)
     with torch.no_grad():
         brevitas_output = model(input_t)
+    if isinstance(brevitas_output, QuantTensor):
+        computed_out = brevitas_output.value
+        scale = brevitas_output.scale
+    else:
+        computed_out = brevitas_output
+        scale = 1.
 
     if tolerance is not None and export_type == 'qcdq':
-        tolerance = tolerance * brevitas_output.scale  # Float Output, tolerance is +/- output scale
+        tolerance = tolerance * scale  # Float Output, tolerance is +/- output scale
 
     if export_type == 'qonnx':
         exported_model = export_qonnx(model, input_t, export_path=export_name)
@@ -128,13 +152,13 @@ def is_brevitas_ort_close(
         odict = oxe.execute_onnx(exported_model, idict, True)
         ort_output = odict[exported_model.graph.output[0].name]
     else:
-        if export_type == 'qop':
-            export_onnx_qop(model, input_t, export_path=export_name)
-            brevitas_output = brevitas_output.int(float_datatype=False)
-        elif export_type == 'qcdq':
-            export_onnx_qcdq(model, input_t, export_path=export_name)
-        elif export_type == 'qcdq_opset14':
-            export_onnx_qcdq(model, input_t, opset_version=14, export_path=export_name)
+        if export_type == 'qcdq':
+            export_onnx_qcdq(
+                model,
+                input_t,
+                export_path=export_name,
+                export_weight_q_node=export_q_weight,
+                opset_version=onnx_opset)
         elif export_type == 'qonnx_opset14':
             export_qonnx(model, input_t, opset_version=14, export_path=export_name)
         else:
@@ -145,13 +169,13 @@ def is_brevitas_ort_close(
     if first_output_only:
         if isinstance(ort_output, (tuple, list)):
             ort_output = ort_output[0]
-        if isinstance(brevitas_output, tuple):
-            brevitas_output = brevitas_output[0]
+        if isinstance(computed_out, tuple):
+            computed_out = computed_out[0]
         # make sure we are not comparing 0s
-        if (ort_output == 0).all() and (brevitas_output == 0).all():
+        if (ort_output == 0).all() and (computed_out == 0).all():
             pytest.skip("Skip testing against all 0s.")
 
-    return recursive_allclose(ort_output, brevitas_output, tolerance)
+    return recursive_allclose(ort_output, computed_out, tolerance)
 
 
 def gen_linspaced_data(num_samples, min_val=-1.0, max_val=1.0):
